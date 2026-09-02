@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Demo - Salomão Widget</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+      min-height: 100vh;
+      color: white;
+    }
+
+    .demo-header {
+      background: rgba(0, 0, 0, 0.3);
+      padding: 20px 40px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .demo-logo {
+      font-size: 24px;
+      font-weight: bold;
+      color: #22c55e;
+    }
+
+    .demo-nav {
+      display: flex;
+      gap: 30px;
+    }
+
+    .demo-nav a {
+      color: #ccc;
+      text-decoration: none;
+      transition: color 0.2s;
+    }
+
+    .demo-nav a:hover {
+      color: white;
+    }
+
+    .demo-hero {
+      text-align: center;
+      padding: 100px 20px;
+    }
+
+    .demo-hero h1 {
+      font-size: 48px;
+      margin-bottom: 20px;
+    }
+
+    .demo-hero h1 span {
+      color: #22c55e;
+    }
+
+    .demo-hero p {
+      font-size: 20px;
+      color: #888;
+      max-width: 600px;
+      margin: 0 auto 40px;
+    }
+
+    .demo-cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+      gap: 20px;
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 20px;
+    }
+
+    .demo-card {
+      background: rgba(255, 255, 255, 0.05);
+      border-radius: 16px;
+      padding: 30px;
+      border: 1px solid rgba(255, 255, 255, 0.1);
+    }
+
+    .demo-card h3 {
+      color: #22c55e;
+      margin-bottom: 10px;
+    }
+
+    .demo-card p {
+      color: #888;
+      line-height: 1.6;
+    }
+
+    .demo-footer {
+      text-align: center;
+      padding: 40px;
+      color: #666;
+      font-size: 14px;
+    }
+
+    .demo-code {
+      background: #0d1117;
+      border-radius: 12px;
+      padding: 20px;
+      margin: 40px auto;
+      max-width: 800px;
+      text-align: left;
+      overflow-x: auto;
+    }
+
+    .demo-code pre {
+      color: #c9d1d9;
+      font-family: 'Monaco', 'Menlo', monospace;
+      font-size: 14px;
+      line-height: 1.6;
+    }
+
+    .demo-code .comment {
+      color: #8b949e;
+    }
+
+    .demo-code .string {
+      color: #a5d6ff;
+    }
+
+    .demo-code .tag {
+      color: #7ee787;
+    }
+  </style>
+</head>
+<body>
+  <header class="demo-header">
+    <div class="demo-logo">🏛️ inChurch</div>
+    <nav class="demo-nav">
+      <a href="#">Início</a>
+      <a href="#">Dúvidas</a>
+      <a href="#">Protocolo</a>
+      <a href="#">Artigos</a>
+      <a href="#">Contatos</a>
+    </nav>
+  </header>
+
+  <section class="demo-hero">
+    <h1>A Paz, <span>Igreja!</span></h1>
+    <p>Bem vindo à sua Central de Ajuda. Como iremos te ajudar hoje? 💚</p>
+  </section>
+
+  <section class="demo-cards">
+    <div class="demo-card">
+      <h3>🤖 Assistente IA - Salomão</h3>
+      <p>Tire suas dúvidas com o Salomão. Nosso assistente de IA está pronto para responder suas perguntas sobre a plataforma inChurch 24/7.</p>
+    </div>
+    <div class="demo-card">
+      <h3>📋 Consulta de Protocolos</h3>
+      <p>Acompanhe o andamento dos seus chamados abertos no suporte técnico.</p>
+    </div>
+    <div class="demo-card">
+      <h3>📚 Tutoriais & Artigos</h3>
+      <p>Explore nossa base de conhecimento completa com guias e tutoriais.</p>
+    </div>
+  </section>
+
+  <div class="demo-code">
+    <pre><span class="comment">&lt;!-- Como integrar o Salomão no seu site --&gt;</span>
+
+<span class="comment">&lt;!-- 1. Configuração (opcional) --&gt;</span>
+<span class="tag">&lt;script&gt;</span>
+  window.SALOMAO_API_URL = <span class="string">'http://localhost:8000'</span>;
+  window.SALOMAO_SUGGESTIONS = [<span class="string">'Como começar?'</span>, <span class="string">'Ajuda técnica'</span>, <span class="string">'Eventos'</span>];
+<span class="tag">&lt;/script&gt;</span>
+
+<span class="comment">&lt;!-- 2. Incluir o widget --&gt;</span>
+<span class="tag">&lt;script src=<span class="string">"salomao-widget.js"</span>&gt;&lt;/script&gt;</span></pre>
+  </div>
+
+  <footer class="demo-footer">
+    <p>Demo do Widget Salomão - Central de Ajuda inChurch</p>
+  </footer>
+
+  <!-- Configuração do Widget -->
+  <script>
+    window.SALOMAO_API_URL = 'http://localhost:8000';
+    window.SALOMAO_SUGGESTIONS = ['Como começar?', 'Ajuda técnica', 'Eventos'];
+  </script>
+
+  <!-- Widget Salomão -->
+  <script src="salomao-widget.js"></script>
+</body>
+</html>

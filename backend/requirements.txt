@@ -1,0 +1,17 @@
+openai>=1.40.0
+pinecone==5.4.2
+fastapi>=0.109.0
+uvicorn>=0.27.0
+python-dotenv>=1.0.0
+python-multipart>=0.0.6
+pydantic>=2.0.0
+httpx>=0.26.0
+pillow>=10.0.0
+supabase>=2.0.0
+requests>=2.31.0
+agno>=2.3.24,<4
+regex>=2024.11.6
+opentelemetry-api>=1.39.0
+opentelemetry-sdk>=1.39.0
+openinference-instrumentation-agno>=0.1.25
+python-dateutil>=2.8.2

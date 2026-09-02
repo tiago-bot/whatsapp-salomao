@@ -1,0 +1,30 @@
+{
+  "uid": "SalomaoWhatsAppBot_webhooks",
+  "type": "webhooks",
+  "config": {
+    "settings": {
+      "targetUrl": "https://salomao-whatsapp-production.up.railway.app/webhook/hubspot",
+      "maxConcurrentRequests": 10
+    },
+    "subscriptions": {
+      "crmObjects": [],
+      "legacyCrmObjects": [
+        {
+          "subscriptionType": "ticket.propertyChange",
+          "propertyName": "hs_v2_date_entered_1269308450",
+          "active": true
+        }
+      ],
+      "hubEvents": [
+        {
+          "subscriptionType": "conversation.creation",
+          "active": true
+        },
+        {
+          "subscriptionType": "conversation.newMessage",
+          "active": true
+        }
+      ]
+    }
+  }
+}

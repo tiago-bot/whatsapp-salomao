@@ -1,0 +1,40 @@
+{
+  "uid": "SalomaoWhatsAppBot_app",
+  "type": "app",
+  "config": {
+    "description": "Salomão AI - Assistente inteligente para atendimento WhatsApp via HubSpot. Usa webhook para detectar novas conversas e polling para processar mensagens.",
+    "name": "Salomao WhatsApp Bot",
+    "distribution": "private",
+    "auth": {
+      "type": "static",
+      "requiredScopes": [
+        "oauth",
+        "tickets",
+        "crm.objects.contacts.read",
+        "crm.objects.contacts.write",
+        "crm.objects.deals.read",
+        "crm.objects.companies.read",
+        "conversations.read",
+        "conversations.write",
+        "crm.schemas.contacts.read",
+        "crm.objects.owners.read"
+      ],
+      "optionalScopes": [],
+      "conditionallyRequiredScopes": []
+    },
+    "permittedUrls": {
+      "fetch": [
+        "https://api.hubapi.com",
+        "https://salomao-whatsapp-production.up.railway.app"
+      ],
+      "iframe": [],
+      "img": []
+    },
+    "support": {
+      "supportEmail": "suporte@inchurch.com.br",
+      "documentationUrl": "https://github.com/tiago-bot/salomao-whatsapp",
+      "supportUrl": "https://inchurch.com.br/suporte",
+      "supportPhone": "+5511941436554"
+    }
+  }
+}
