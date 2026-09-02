@@ -44,7 +44,7 @@ def fetch_event_details(event_id: int) -> Optional[dict]:
             return None
 
     except Exception as e:
-        logger.error(f"Exceção ao buscar evento {event_id}: {str(e)}")
+        logger.error(f"Exceção ao buscar evento {event_id}: {type(e).__name__}")
         return None
 
 

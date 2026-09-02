@@ -6,18 +6,24 @@ import mimetypes
 from threading import Lock
 from urllib.parse import urlsplit
 import uuid
+import time
 
 import requests
 
 from config import DELIVERY_DB_PATH, WHATSAPP_MAX_MESSAGE_LENGTH
 from delivery_store import DeliveryStore
+from conversation_context import bounded_history, history_before
+from logging_config import log_context
 from salomao_agent import salomao
 from whatsapp_formatting import format_whatsapp, split_whatsapp
+from scope_policy import (SCOPE_POLICY_VERSION, SCOPE_UNAVAILABLE, SCOPE_REDIRECT,
+                          explicit_external_request, obvious_external_answer, approval_digest, approved_delivery)
 from hubspot_service import (
     get_tickets_for_salomao, get_ticket_by_id, get_conversation_thread_by_ticket,
     get_thread_messages, parse_incoming_messages, reply_to_visitor,
     transfer_ticket_to_human_support, SALOMAO_PIPELINE, SALOMAO_STATUS,
     SALOMAO_ACTOR_ID, get_headers,
+    HubSpotReadError,
 )
 
 logger = logging.getLogger("salomao.hubspot_bot")
@@ -45,8 +51,22 @@ class HubSpotSalomaoBot:
                 and str(props.get("hs_pipeline_stage", "")) == SALOMAO_STATUS
                 and str(props.get("hubspot_owner_id", "")) == SALOMAO_ACTOR_ID.removeprefix("A-"))
 
+    @staticmethod
+    def _ineligible_reason(ticket):
+        if not ticket:
+            return "ticket_unavailable"
+        props = ticket.get("properties", {})
+        for key, expected in (("hs_pipeline", SALOMAO_PIPELINE), ("hs_pipeline_stage", SALOMAO_STATUS),
+                              ("hubspot_owner_id", SALOMAO_ACTOR_ID.removeprefix("A-"))):
+            if key not in props or props[key] is None:
+                return "missing_" + key
+            if str(props[key]) != expected:
+                return "different_" + key
+        return ""
+
     def get_unprocessed_visitor_messages(self, thread_id):
-        messages = parse_incoming_messages(get_thread_messages(thread_id))
+        messages = parse_incoming_messages(get_thread_messages(thread_id, strict=True))
+        self.store.remember_messages(thread_id, messages)
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=self.MESSAGE_MAX_AGE_MINUTES)
         pending = []
         for message in messages:
@@ -64,6 +84,8 @@ class HubSpotSalomaoBot:
                 logger.warning("Ignoring message without a valid timestamp")
                 continue
             pending.append(message)
+        logger.debug("Mensagens verificadas", extra={"event": "messages.scanned", "thread_id": str(thread_id),
+            "message_count": len(messages), "pending_count": len(pending), "skipped_count": len(messages) - len(pending)})
         return sorted(pending, key=lambda msg: msg.get("created_at", ""))
 
     def _download_attachment_as_base64(self, url):
@@ -90,8 +112,17 @@ class HubSpotSalomaoBot:
         return base64.b64encode(data).decode("ascii")
 
     def process_message(self, thread_id, message):
+        if explicit_external_request(message.get("text", "")):
+            logger.info("Pergunta externa bloqueada antes do agente", extra={"event": "scope.input_blocked", "reason": "deterministic_rule"})
+            return {"success": True, "response": SCOPE_REDIRECT, "answer_status": "out_of_scope",
+                    "transfer_requested": False, "scope_policy_version": SCOPE_POLICY_VERSION}
         attachments = message.get("raw", {}).get("attachments", [])
-        kwargs = {}
+        history = history_before(self.store.conversation_messages(thread_id), message)
+        kwargs = {"conversation_history": history}
+        selected, truncated = bounded_history(history)
+        logger.info("Contexto da conversa preparado", extra={"event": "context.loaded", "thread_id": str(thread_id),
+            "message_id": message.get("id"), "context_messages": len(selected), "context_truncated": truncated,
+            "context_chars": sum(len(m["content"]) for m in selected), "source": "hubspot_and_delivery_cache"})
         try:
             for attachment in attachments:
                 url = attachment.get("url", "")
@@ -117,32 +148,58 @@ class HubSpotSalomaoBot:
             )
         except ValueError:
             return {"response": "Não consegui ler esse anexo. Envie uma imagem ou áudio por vez, ou descreva a dúvida em texto.",
-                    "success": False, "transfer_requested": False, "answer_status": "unavailable"}
+                    "success": False, "transfer_requested": False, "answer_status": "unavailable", "scope_policy_version": SCOPE_POLICY_VERSION}
         except Exception as exc:
             logger.error("Message generation failed | type=%s", type(exc).__name__)
             result = {"success": False}
         if not result.get("response"):
             result["response"] = "Não consegui consultar a orientação agora. Tente novamente em instantes ou peça para falar com um atendente."
+        if not message.get("text") and result.get("audio_transcription"):
+            self.store.remember_messages(thread_id, [{**message, "is_from_visitor": True,
+                "text": result["audio_transcription"]}])
         # A documented knowledge gap is actionable in the WhatsApp helpdesk.
         if result.get("answer_status") == "no_match":
             result["transfer_requested"] = True
         if result.get("transfer_requested"):
             result["response"] = "Vou encaminhar seu atendimento para a equipe da inChurch."
         result["response"] = format_whatsapp(result["response"])
+        if (obvious_external_answer(result["response"]) or
+                (result.get("scope_policy_version") != SCOPE_POLICY_VERSION and
+                 self.agent.validate_response_scope(message.get("text", ""), result["response"]) is not True)):
+            result.update(response=SCOPE_UNAVAILABLE, answer_status="scope_blocked", transfer_requested=False)
+            logger.warning("Resposta impedida de entrar na fila", extra={"event": "scope.output_blocked"})
+        result["scope_policy_version"] = SCOPE_POLICY_VERSION
         return result
 
     def _deliver(self, entry, ticket_id):
         thread_id, message_id, payload = entry["thread_id"], entry["message_id"], entry["payload"]
+        if not approved_delivery(payload):
+            # Retain the payload and confirmed-part receipts for audit. Do not
+            # replay a legacy/unvalidated reply after deploying a stricter policy.
+            self.store.quarantine(thread_id, message_id, "scope_approval_missing_or_changed")
+            logger.warning("Entrega nao aprovada retida para auditoria", extra={"event": "delivery.quarantined",
+                "thread_id": thread_id, "message_id": message_id, "reason": "scope_approval_missing_or_changed"})
+            return {"message_id": message_id, "sent": False, "answer_status": "scope_blocked"}
         for index in range(entry["sent_parts"], len(payload["parts"])):
-            if not reply_to_visitor(thread_id, payload["parts"][index]):
+            sent = reply_to_visitor(thread_id, payload["parts"][index])
+            if not sent:
+                logger.error("Falha no envio; parte preservada para nova tentativa", extra={"event": "delivery.failed",
+                    "thread_id": thread_id, "message_id": message_id, "part": index + 1})
                 return {"message_id": message_id, "sent": False, "error": "Falha ao enviar via HubSpot"}
             self.store.confirm_part(thread_id, message_id, index + 1)
+            self.store.remember_messages(thread_id, [{"id": sent.get("id") or f"sent_{message_id}_{index}",
+                "created_at": sent.get("createdAt") or datetime.now(timezone.utc).isoformat(),
+                "text": payload["parts"][index], "is_from_visitor": False}])
+            logger.info("Parte da resposta enviada", extra={"event": "delivery.part_sent", "thread_id": thread_id,
+                "message_id": message_id, "part": index + 1, "parts": len(payload["parts"])})
         if payload.get("transfer_requested"):
             if not ticket_id or not transfer_ticket_to_human_support(ticket_id):
                 # Parts remain confirmed; next poll retries only the handoff.
                 return {"message_id": message_id, "sent": True, "transferred": False,
                         "error": "Transferência pendente; será tentada novamente"}
         self.store.complete(thread_id, message_id)
+        logger.info("Entrega concluida", extra={"event": "delivery.completed", "thread_id": thread_id,
+            "message_id": message_id, "handoff": bool(payload.get("transfer_requested"))})
         return {"message_id": message_id, "user_message": payload.get("user_message", ""),
                 "bot_response": payload["response"], "sent": True,
                 "transferred": bool(payload.get("transfer_requested")),
@@ -151,6 +208,7 @@ class HubSpotSalomaoBot:
     def process_thread(self, thread_id, ticket_id=None):
         lock = self._locks[hash(thread_id) % len(self._locks)]
         if not lock.acquire(blocking=False):
+            logger.debug("Conversa ja esta em processamento", extra={"event": "turn.skipped", "thread_id": str(thread_id), "reason": "thread_locked"})
             return []
         try:
             # Recheck eligibility even for the direct thread-processing endpoint.
@@ -160,35 +218,58 @@ class HubSpotSalomaoBot:
                 return []
             responses = []
             for entry in self.store.pending(thread_id):
-                delivered = self._deliver(entry, ticket_id)
+                with log_context(thread_id=str(thread_id), ticket_id=str(ticket_id), message_id=entry["message_id"],
+                                 session_id=self.get_session_id_for_thread(thread_id), run_id=entry["payload"].get("run_id")):
+                    logger.info("Retomando entrega pendente", extra={"event": "delivery.retry"})
+                    delivered = self._deliver(entry, ticket_id)
                 responses.append(delivered)
                 if delivered.get("error") or delivered.get("transferred"):
                     return responses
-            for message in self.get_unprocessed_visitor_messages(thread_id):
+            try:
+                pending = self.get_unprocessed_visitor_messages(thread_id)
+            except HubSpotReadError:
+                logger.warning("Processamento adiado: historico indisponivel", extra={"event": "turn.deferred", "reason": "history_unavailable"})
+                return responses + [{"error": "history_unavailable", "sent": False}]
+            for message in pending:
+                if self.store.get(thread_id, message["id"]):
+                    continue
                 # Ownership may change while a previous response was generated.
                 if not self._eligible(get_ticket_by_id(ticket_id)):
                     break
-                result = self.process_message(thread_id, message)
-                parts = split_whatsapp(result["response"], WHATSAPP_MAX_MESSAGE_LENGTH)
-                entry = self.store.enqueue(thread_id, message["id"], {
-                    "response": result["response"], "parts": parts,
-                    "user_message": message.get("text", ""),
-                    "transfer_requested": bool(result.get("transfer_requested")),
-                    "answer_status": result.get("answer_status", "answered"),
-                })
-                if not self._eligible(get_ticket_by_id(ticket_id)):
-                    break
-                delivered = self._deliver(entry, ticket_id)
-                responses.append(delivered)
-                if delivered.get("error") or delivered.get("transferred"):
-                    break
+                run_id = uuid.uuid4().hex
+                with log_context(thread_id=str(thread_id), ticket_id=str(ticket_id), message_id=message["id"],
+                                 session_id=self.get_session_id_for_thread(thread_id), run_id=run_id):
+                    started = time.perf_counter()
+                    logger.info("Processando mensagem", extra={"event": "turn.started"})
+                    result = self.process_message(thread_id, message)
+                    logger.info("Resposta preparada", extra={"event": "turn.generated", "model": result.get("model_used"),
+                        "answer_status": result.get("answer_status"), "handoff": bool(result.get("transfer_requested")),
+                        "duration_ms": round((time.perf_counter() - started) * 1000)})
+                    parts = split_whatsapp(result["response"], WHATSAPP_MAX_MESSAGE_LENGTH)
+                    entry = self.store.enqueue(thread_id, message["id"], {
+                        "response": result["response"], "parts": parts, "run_id": run_id,
+                        "user_message": message.get("text", ""),
+                        "transfer_requested": bool(result.get("transfer_requested")),
+                        "answer_status": result.get("answer_status", "answered"),
+                        "scope_policy_version": result.get("scope_policy_version"),
+                        "scope_digest": approval_digest(result["response"], parts),
+                    })
+                    if not self._eligible(get_ticket_by_id(ticket_id)):
+                        logger.info("Envio suspenso: ticket fora dos filtros", extra={"event": "delivery.deferred", "reason": "eligibility_changed"})
+                        break
+                    delivered = self._deliver(entry, ticket_id)
+                    responses.append(delivered)
+                    if delivered.get("error") or delivered.get("transferred"):
+                        break
             return responses
         finally:
             lock.release()
 
     def process_ticket(self, ticket_id):
-        if not self._eligible(get_ticket_by_id(ticket_id)):
-            return {"success": False, "ticket_id": ticket_id, "responses": [], "error": "Ticket fora dos filtros do Salomão"}
+        reason = self._ineligible_reason(get_ticket_by_id(ticket_id))
+        if reason:
+            logger.debug("Ticket nao processado", extra={"event": "ticket.skipped", "ticket_id": str(ticket_id), "reason": reason})
+            return {"success": False, "ticket_id": ticket_id, "responses": [], "error": "Ticket fora dos filtros do Salomão", "reason": reason}
         thread = get_conversation_thread_by_ticket(ticket_id)
         if not thread or not thread.get("id"):
             return {"success": False, "ticket_id": ticket_id, "error": "Thread não encontrado"}
@@ -208,10 +289,13 @@ class HubSpotSalomaoBot:
         with lock:
             if self.store.pending(thread_id):
                 return {"success": False, "error": "Há uma entrega pendente nesta conversa"}
-            result = self.process_message(thread_id, {"text": question})
+            observed = parse_incoming_messages(get_thread_messages(thread_id, strict=True))
+            self.store.remember_messages(thread_id, observed)
+            result = self.process_message(thread_id, {"text": question, "id": "manual", "created_at": datetime.now(timezone.utc).isoformat()})
+            parts = split_whatsapp(result["response"], WHATSAPP_MAX_MESSAGE_LENGTH)
             entry = self.store.enqueue(thread_id, "manual_" + uuid.uuid4().hex, {
                 **result, "user_message": question,
-                "parts": split_whatsapp(result["response"], WHATSAPP_MAX_MESSAGE_LENGTH),
+                "parts": parts, "scope_digest": approval_digest(result["response"], parts),
             })
             if not self._eligible(get_ticket_by_id(ticket_id)):
                 return {"success": False, "error": "Responsável pelo ticket mudou"}

@@ -19,6 +19,8 @@ from database import ConversationDatabase
 class ScopeRegressions(unittest.TestCase):
     def setUp(self):
         self.agent = module.SalomaoAgent()
+        patch.object(self.agent, "validate_response_scope", return_value=True).start()
+        self.addCleanup(patch.stopall)
 
     def test_questions_from_production_logs_reach_knowledge_pipeline(self):
         questions = [
@@ -37,7 +39,7 @@ class ScopeRegressions(unittest.TestCase):
                 classifier.assert_not_called()
 
     def test_unknown_words_and_followups_get_semantic_review_with_recent_context(self):
-        for question in ["não achei essa opção", "como publico uma transmissão?", "receita por categoria", "Quem ganhou a copa?"]:
+        for question in ["não achei essa opção", "como publico uma transmissão?", "receita por categoria", "Explique relatividade"]:
             with self.subTest(question=question), patch.object(module, "Agent") as classifier:
                 classifier.return_value.run.return_value = SimpleNamespace(content='{"status":"uncertain","confidence":0.4}')
                 scope = self.agent._classify_text_scope(question, "Cliente: Como criar um evento?\nSalomao: Abra Eventos.")
@@ -54,11 +56,11 @@ class ScopeRegressions(unittest.TestCase):
         with patch.object(module, "Agent", side_effect=TimeoutError("test")):
             self.assertEqual(self.agent._classify_text_scope("não consegui").status, module.ImageScopeStatus.UNCERTAIN)
 
-    def test_process_message_only_blocks_confident_external_intent(self):
+    def test_process_message_requires_positive_scope_approval(self):
         for status, confidence, blocked in [
             (module.ImageScopeStatus.INCHURCH, 1, False),
-            (module.ImageScopeStatus.UNCERTAIN, 0.8, False),
-            (module.ImageScopeStatus.OUT_OF_SCOPE, 0.5, False),
+            (module.ImageScopeStatus.UNCERTAIN, 0.8, True),
+            (module.ImageScopeStatus.OUT_OF_SCOPE, 0.5, True),
             (module.ImageScopeStatus.OUT_OF_SCOPE, 0.98, True),
         ]:
             with self.subTest(status=status, confidence=confidence), patch.object(module, "db") as db, patch.object(module, "SalomaoSupervisorAgent") as supervisor, patch.object(self.agent, "_classify_text_scope", return_value=module.TextScopeResult(status=status, confidence=confidence)), patch.object(self.agent, "refresh_conversation_summary"), patch.object(self.agent, "_record_turn_metric"):

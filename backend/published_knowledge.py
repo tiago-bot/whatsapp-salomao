@@ -19,6 +19,14 @@ from config import KB_SUPABASE_URL, KB_SUPABASE_ANON_KEY
 logger = logging.getLogger(__name__)
 STOP = set("a o as os de da do das dos em no na nos nas e ou um uma para por com que qual quais como onde quando fazer faco realizar quero preciso gostaria posso pode consigo funciona funcionar area opcao botao tela esse essa isso ele ela aqui agora nao sim meu minha ao se ser esta estar tem foi ainda sobre inchurch church in painel plataforma mais muito favor ajuda favor me pelo pela aparece aparecer sumiu so".split())
 STOP.update({"pedir", "solicitar", "solicito"})
+STOP.update({"mim", "pra", "voce", "voces", "obrigado", "obrigada", "ola", "bom", "dia",
+             "tarde", "noite", "certo", "entendi", "tentei", "consegui", "funcionou", "continua"})
+
+# These are subject signals, not routing rules. A newly named subject can reset
+# context; generic UI symptoms must not reset it merely because wording changed.
+SUBJECTS = {"estorno", "cancelamento", "contrato", "oracao", "evento", "ingresso", "inscricao",
+            "celula", "membro", "pessoa", "boleto", "pix", "cartao", "senha", "login",
+            "financeiro", "doacao", "relatorio", "notificacao", "transmissao", "cupom"}
 ALIASES = {
     "estornar": "estorno", "estornos": "estorno", "reembolso": "estorno", "devolver": "estorno",
     "cancelar": "cancelamento", "cancelo": "cancelamento", "encerrar": "cancelamento", "encerro": "cancelamento",
@@ -43,25 +51,57 @@ def safe_url(url: str) -> bool:
 
 
 def contextual_query(query: str, history: str) -> str:
-    """Only borrow the most recent customer topic for short follow-ups.
+    """Keep the latest CUSTOMER subject across symptoms/short answers.
 
-    Assistant replies and older topics never become search queries.
+    Historical assistant guesses are not a topic authority. Explicit subject
+    changes win; wording order/length alone must not turn a refund into cells.
     """
-    current = terms(query)
-    if len(current) > 3 or not history:
+    if not history:
         return query
-    prior = re.findall(r"^Cliente: (.+)$", history, flags=re.MULTILINE)
-    for previous in reversed(prior[-3:]):
-        if terms(previous):
-            # A complete new question has its own topic; explicit follow-ups or
-            # short answers such as 'de evento' inherit the prior intention.
-            assistant = history.rsplit("Salomao:", 1)[-1] if "Salomao:" in history else ""
-            is_choice = ("?" in assistant and set(current).issubset(set(terms(assistant))) and
-                         not re.match(r"^(como|onde|qual|quero|preciso|pedidos)\b", normalize(query)))
-            if not current or is_choice or re.match(r"^(e\b|de\b|do\b|da\b|nao\b|sim\b|no\b|na\b)", normalize(query)):
-                return f"{previous} {query}"
-            break
-    return query
+
+    def follows(text, anchor, assistant):
+        normalized = normalize(text).strip()
+        current = set(terms(text))
+        if re.match(r"^(mudando de assunto|outra (duvida|pergunta)|agora (quero|preciso))\b", normalized):
+            return False
+        choice = ("?" in assistant and bool(current) and current.issubset(set(terms(assistant))) and
+                  not re.match(r"^(como|onde|qual|quero|preciso|pedidos)\b", normalized))
+        modifier = bool(re.match(r"^(de|do|da|no|na)\b", normalized))
+        if choice or modifier:
+            return True
+        # 'Não consigo criar evento' after refunds is a new explicit request.
+        if current & SUBJECTS and not (current & SUBJECTS & set(terms(anchor))):
+            return False
+        return (not current or bool(re.match(r"^(e\b|nao\b|sim\b)", normalized)) or
+                bool(re.search(r"\b(botao|opcao|isso|essa|esse|ele|ela|aqui|sumiu|aparece|"
+                               r"consegui|funcionou|continua|deu certo|tentei|fiz)\b", normalized)))
+
+    anchor, assistant = "", ""
+    for role, content in re.findall(r"^(Cliente|Salomao): (.+)$", history, flags=re.MULTILINE):
+        if role == "Salomao":
+            assistant = content
+            continue
+        if not terms(content):
+            continue
+        if anchor and follows(content, anchor, assistant):
+            # Retain short object selections (refund -> of an event), but not
+            # an ever-growing chain of symptoms or an assistant's wrong topic.
+            if set(terms(content)) & SUBJECTS:
+                anchor = f"{anchor} {content}"[-1600:]
+        else:
+            anchor = content
+    return f"{anchor} {query}" if anchor and follows(query, anchor, assistant) else query
+
+
+def context_relevant_articles(articles, query, history):
+    """Do not ground a follow-up in documents unrelated to its active subject."""
+    resolved = contextual_query(query, history)
+    if resolved == query:
+        return articles
+    anchors = set(terms(resolved[:-len(query)].strip())) & SUBJECTS if query else set()
+    if not anchors:
+        return articles
+    return [a for a in articles if anchors & set(terms(" ".join(str(a.get(k) or "") for k in ("title", "category", "content"))))]
 
 
 class PublishedKnowledge:

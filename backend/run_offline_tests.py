@@ -26,6 +26,7 @@ if __name__ == "__main__":
     with patch.object(socket.socket, "connect", local_only):
         suite = unittest.defaultTestLoader.loadTestsFromNames([
             "test_scope_regressions", "test_grounded_answers", "test_whatsapp", "test_api_contract",
+            "test_conversation_continuity", "test_logging", "test_strict_scope",
         ])
         result = unittest.TextTestRunner(verbosity=2).run(suite)
     raise SystemExit(0 if result.wasSuccessful() else 1)

@@ -110,6 +110,7 @@ class DeliveryTests(unittest.TestCase):
         self.path = Path(self.temp.name) / "delivery.sqlite3"
         self.store = DeliveryStore(self.path)
         self.agent = MagicMock()
+        self.agent.validate_response_scope.return_value = True
         self.agent.process_message.return_value = {"success": True, "response": "## Orientação\n\nAbra **Eventos**.", "answer_status": "answered"}
         self.bot = bot_module.HubSpotSalomaoBot(store=self.store, agent=self.agent)
         self.ticket = {"properties": {"hs_pipeline": bot_module.SALOMAO_PIPELINE,
@@ -124,7 +125,9 @@ class DeliveryTests(unittest.TestCase):
         return {"id": message_id, "is_from_visitor": True, "created_at": datetime.now(timezone.utc).isoformat(), "text": "Como configurar evento?", **kwargs}
 
     def enqueue(self, transfer=False):
-        return self.store.enqueue("t1", "m1", {"parts": ["Parte um", "Parte dois"], "response": "Parte um\n\nParte dois", "transfer_requested": transfer})
+        payload = {"parts": ["Parte um", "Parte dois"], "response": "Parte um\n\nParte dois", "transfer_requested": transfer}
+        payload.update(scope_policy_version=bot_module.SCOPE_POLICY_VERSION, scope_digest=bot_module.approval_digest(payload["response"], payload["parts"]))
+        return self.store.enqueue("t1", "m1", payload)
 
     def test_partial_failure_retries_only_missing_part_after_restart(self):
         entry = self.enqueue()
@@ -157,7 +160,8 @@ class DeliveryTests(unittest.TestCase):
 
     def test_no_shared_transfer_state_between_threads(self):
         first = self.enqueue(transfer=True)
-        second = self.store.enqueue("t2", "m1", {"parts": ["Olá"], "response": "Olá"})
+        second = self.store.enqueue("t2", "m1", {"parts": ["Olá"], "response": "Olá", "scope_policy_version": bot_module.SCOPE_POLICY_VERSION,
+            "scope_digest": bot_module.approval_digest("Olá", ["Olá"])})
         with patch.object(bot_module, "reply_to_visitor", return_value={"id": "sent"}), patch.object(bot_module, "transfer_ticket_to_human_support", return_value=True) as transfer:
             self.bot._deliver(second, "ticket2")
             transfer.assert_not_called()

@@ -2,7 +2,7 @@ import hashlib
 from typing import Optional
 from openai import OpenAI
 from pinecone import Pinecone
-from published_knowledge import published_knowledge, contextual_query
+from published_knowledge import published_knowledge, contextual_query, context_relevant_articles
 from config import (
     EMBEDDING_MODEL,
     OPENAI_API_KEY,
@@ -153,7 +153,7 @@ class KnowledgeBase:
         else:
             enhanced_query = query
 
-        return self.search(enhanced_query, top_k=top_k)
+        return context_relevant_articles(self.search(enhanced_query, top_k=top_k), query, conversation_context or "")
 
     def get_formatted_context(
         self,

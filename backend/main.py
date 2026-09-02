@@ -1,5 +1,8 @@
 import base64
 import uuid
+from logging_config import configure_logging
+
+configure_logging()
 from typing import Optional
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware

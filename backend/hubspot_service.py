@@ -40,6 +40,10 @@ TARGET_STATUS = SALOMAO_STATUS
 _cached_bot_actor_id = None
 
 
+class HubSpotReadError(RuntimeError):
+    """A missing/partial history must not be mistaken for a new conversation."""
+
+
 def get_headers() -> dict:
     """Retorna headers para requisições à API do HubSpot."""
     return {
@@ -94,14 +98,14 @@ def get_tickets_in_pipeline(pipeline_id: str = TARGET_PIPELINE, stage_id: str = 
 
         if response.status_code == 200:
             data = response.json()
-            logger.info(f"✅ Encontrados {len(data.get('results', []))} tickets na pipeline {pipeline_id}")
+            logger.info(f"Encontrados {len(data.get('results', []))} tickets na pipeline {pipeline_id}")
             return data.get("results", [])
         else:
-            logger.error(f"❌ Erro ao buscar tickets: {response.status_code} - {response.text}")
+            logger.error(f"Erro ao buscar tickets: {response.status_code}")
             return []
 
     except Exception as e:
-        logger.error(f"❌ Exceção ao buscar tickets: {str(e)}")
+        logger.error(f"Exceção ao buscar tickets: {type(e).__name__}")
         return []
 
 
@@ -131,22 +135,22 @@ def transfer_ticket_to_human_support(ticket_id: str) -> bool:
             }
         }
 
-        logger.info(f"🔄 Transferindo ticket {ticket_id} para atendimento humano...")
-        logger.info(f"   Pipeline: {HUMAN_SUPPORT_PIPELINE}")
-        logger.info(f"   Stage: {HUMAN_SUPPORT_STAGE}")
-        logger.info(f"   Owner: (limpo)")
+        logger.info(f"Transferindo ticket {ticket_id} para atendimento humano...")
+        logger.info(f"Pipeline: {HUMAN_SUPPORT_PIPELINE}")
+        logger.info(f"Stage: {HUMAN_SUPPORT_STAGE}")
+        logger.info(f"Owner: (limpo)")
 
         response = requests.patch(url, headers=get_headers(), json=payload, timeout=30)
 
         if response.status_code == 200:
-            logger.info(f"✅ Ticket {ticket_id} transferido para atendimento humano com sucesso!")
+            logger.info(f"Ticket {ticket_id} transferido para atendimento humano com sucesso!")
             return True
         else:
-            logger.error(f"❌ Erro ao transferir ticket: {response.status_code} - {response.text}")
+            logger.error(f"Erro ao transferir ticket: {response.status_code}")
             return False
 
     except Exception as e:
-        logger.error(f"❌ Exceção ao transferir ticket: {str(e)}")
+        logger.error(f"Exceção ao transferir ticket: {type(e).__name__}")
         return False
 
 
@@ -163,7 +167,7 @@ def get_ticket_by_id(ticket_id: str) -> Optional[dict]:
     try:
         url = f"{HUBSPOT_API_BASE}/crm/v3/objects/tickets/{ticket_id}"
         params = {
-            "properties": "subject,content,hs_pipeline,hs_pipeline_stage,hs_ticket_priority,createdate"
+            "properties": "subject,content,hs_pipeline,hs_pipeline_stage,hubspot_owner_id,hs_ticket_priority,createdate," + SALOMAO_ENTRY_PROPERTY
         }
 
         response = requests.get(url, headers=get_headers(), params=params, timeout=30)
@@ -171,11 +175,11 @@ def get_ticket_by_id(ticket_id: str) -> Optional[dict]:
         if response.status_code == 200:
             return response.json()
         else:
-            logger.error(f"❌ Erro ao buscar ticket {ticket_id}: {response.status_code}")
+            logger.error(f"Erro ao buscar ticket {ticket_id}: {response.status_code}")
             return None
 
     except Exception as e:
-        logger.error(f"❌ Exceção ao buscar ticket: {str(e)}")
+        logger.error(f"Exceção ao buscar ticket: {type(e).__name__}")
         return None
 
 
@@ -193,7 +197,7 @@ def get_conversation_thread_by_ticket(ticket_id: str) -> Optional[dict]:
         url = f"{HUBSPOT_API_BASE}/conversations/v3/conversations/threads"
         params = {
             "associatedTicketId": ticket_id,
-            "associationType": "TICKET"
+            "association": "TICKET"
         }
 
         response = requests.get(url, headers=get_headers(), params=params, timeout=30)
@@ -202,17 +206,17 @@ def get_conversation_thread_by_ticket(ticket_id: str) -> Optional[dict]:
             data = response.json()
             results = data.get("results", [])
             if results:
-                logger.info(f"✅ Thread encontrado para ticket {ticket_id}: {results[0].get('id')}")
+                logger.debug("Conversa localizada", extra={"event": "thread.found", "ticket_id": str(ticket_id), "thread_id": str(results[0].get("id"))})
                 return results[0]
             else:
-                logger.warning(f"⚠️ Nenhum thread encontrado para ticket {ticket_id}")
+                logger.warning(f"Nenhum thread encontrado para ticket {ticket_id}")
                 return None
         else:
-            logger.error(f"❌ Erro ao buscar thread: {response.status_code} - {response.text}")
+            logger.error(f"Erro ao buscar thread: {response.status_code}")
             return None
 
     except Exception as e:
-        logger.error(f"❌ Exceção ao buscar thread: {str(e)}")
+        logger.error(f"Exceção ao buscar thread: {type(e).__name__}")
         return None
 
 
@@ -229,50 +233,61 @@ def get_thread_by_id(thread_id: str) -> Optional[dict]:
     try:
         url = f"{HUBSPOT_API_BASE}/conversations/v3/conversations/threads/{thread_id}"
 
-        response = requests.get(url, headers=get_headers(), timeout=30)
+        response = requests.get(url, headers=get_headers(), params={"association": "TICKET"}, timeout=30)
 
         if response.status_code == 200:
-            return response.json()
+            thread = response.json()
+            thread["associatedTicketId"] = thread.get("associatedTicketId") or (thread.get("threadAssociations") or {}).get("associatedTicketId")
+            return thread
         else:
-            logger.error(f"❌ Erro ao buscar thread {thread_id}: {response.status_code}")
+            logger.error(f"Erro ao buscar thread {thread_id}: {response.status_code}")
             return None
 
     except Exception as e:
-        logger.error(f"❌ Exceção ao buscar thread: {str(e)}")
+        logger.error(f"Exceção ao buscar thread: {type(e).__name__}")
         return None
 
 
-def get_thread_messages(thread_id: str, limit: int = 50) -> List[dict]:
-    """
-    Busca as mensagens de um thread de conversa.
+def get_thread_messages(thread_id: str, limit: int = 100, *, strict: bool = False) -> List[dict]:
+    """Read the NEWEST window with pagination, then return chronological order.
 
-    Args:
-        thread_id: ID do thread
-        limit: Número máximo de mensagens
-
-    Returns:
-        Lista de mensagens ordenadas por data
+    A failed page is never treated as a complete history by the delivery worker.
+    Follow opaque cursors on our fixed API URL, never a server-provided URL.
     """
     try:
         url = f"{HUBSPOT_API_BASE}/conversations/v3/conversations/threads/{thread_id}/messages"
-        params = {"limit": limit}
-
-        response = requests.get(url, headers=get_headers(), params=params, timeout=30)
-
-        if response.status_code == 200:
+        limit = min(500, max(1, limit))
+        params = {"limit": min(limit, 100), "sort": "-createdAt"}
+        messages, seen_cursors = {}, set()
+        for page in range(10):
+            response = requests.get(url, headers=get_headers(), params=params, timeout=30)
+            if response.status_code != 200:
+                logger.error("Falha ao ler historico", extra={"event": "history.fetch_failed",
+                    "thread_id": str(thread_id), "status_code": response.status_code})
+                raise HubSpotReadError("history_unavailable")
             data = response.json()
-            messages = data.get("results", [])
-
-            messages.sort(key=lambda x: x.get("createdAt", ""))
-
-            logger.info(f"✅ {len(messages)} mensagens encontradas no thread {thread_id}")
-            return messages
+            for message in data.get("results", []):
+                if message.get("id"):
+                    messages[str(message["id"])] = message
+            after = (data.get("paging") or {}).get("next", {}).get("after")
+            if len(messages) >= limit or not after:
+                break
+            if str(after) in seen_cursors:
+                raise HubSpotReadError("history_cursor_repeated")
+            seen_cursors.add(str(after))
+            params["after"] = after
         else:
-            logger.error(f"❌ Erro ao buscar mensagens: {response.status_code} - {response.text}")
-            return []
-
-    except Exception as e:
-        logger.error(f"❌ Exceção ao buscar mensagens: {str(e)}")
+            raise HubSpotReadError("history_page_limit")
+        result = sorted(messages.values(), key=lambda m: (m.get("createdAt", ""), str(m.get("id", ""))))[-limit:]
+        logger.debug("Historico carregado", extra={"event": "history.fetched", "thread_id": str(thread_id),
+                                                  "message_count": len(result), "page_count": page + 1})
+        return result
+    except Exception as exc:
+        if not isinstance(exc, HubSpotReadError):
+            logger.error("Falha ao ler historico", extra={"event": "history.fetch_failed",
+                "thread_id": str(thread_id), "error_type": type(exc).__name__})
+        if strict:
+            raise HubSpotReadError("history_unavailable") from None
         return []
 
 
@@ -297,7 +312,7 @@ def get_actor_info(actor_id: str) -> Optional[dict]:
             return None
 
     except Exception as e:
-        logger.error(f"❌ Exceção ao buscar actor: {str(e)}")
+        logger.error(f"Exceção ao buscar actor: {type(e).__name__}")
         return None
 
 
@@ -326,14 +341,14 @@ def get_hubspot_bot_actor_id() -> Optional[str]:
                 owner_id = owners[0].get("userId") or owners[0].get("id")
                 if owner_id:
                     _cached_bot_actor_id = f"A-{owner_id}"
-                    logger.info(f"✅ Bot actorId configurado: {_cached_bot_actor_id}")
+                    logger.info(f"Bot actorId configurado: {_cached_bot_actor_id}")
                     return _cached_bot_actor_id
 
-        logger.warning("⚠️ Nenhum owner encontrado no HubSpot")
+        logger.warning("Nenhum owner encontrado no HubSpot")
         return None
 
     except Exception as e:
-        logger.error(f"❌ Erro ao buscar bot actorId: {str(e)}")
+        logger.error(f"Erro ao buscar bot actorId: {type(e).__name__}")
         return None
 
 
@@ -357,13 +372,13 @@ def get_agent_actor_from_thread(thread_id: str) -> Optional[str]:
                 for sender in senders:
                     actor_id = sender.get("actorId", "")
                     if actor_id.startswith("A-"):
-                        logger.info(f"✅ Agent actorId encontrado no thread: {actor_id}")
+                        logger.info(f"Agent actorId encontrado no thread: {actor_id}")
                         return actor_id
 
         return get_hubspot_bot_actor_id()
 
     except Exception as e:
-        logger.error(f"❌ Erro ao buscar agent actor: {str(e)}")
+        logger.error(f"Erro ao buscar agent actor: {type(e).__name__}")
         return None
 
 
@@ -411,14 +426,14 @@ def send_message_to_thread(
         response = requests.post(url, headers=get_headers(), json=payload, timeout=30)
 
         if response.status_code in [200, 201]:
-            logger.info(f"✅ Mensagem enviada para thread {thread_id}")
+            logger.info(f"Mensagem enviada para thread {thread_id}")
             return response.json()
         else:
-            logger.error(f"❌ Erro ao enviar mensagem: {response.status_code} - {response.text}")
+            logger.error(f"Erro ao enviar mensagem: {response.status_code}")
             return None
 
     except Exception as e:
-        logger.error(f"❌ Exceção ao enviar mensagem: {str(e)}")
+        logger.error(f"Exceção ao enviar mensagem: {type(e).__name__}")
         return None
 
 
@@ -468,14 +483,14 @@ def send_image_to_thread(
         response = requests.post(url, headers=get_headers(), json=payload, timeout=30)
 
         if response.status_code in [200, 201]:
-            logger.info(f"✅ Imagem enviada para thread {thread_id}")
+            logger.info(f"Imagem enviada para thread {thread_id}")
             return response.json()
         else:
-            logger.error(f"❌ Erro ao enviar imagem: {response.status_code} - {response.text}")
+            logger.error(f"Erro ao enviar imagem: {response.status_code}")
             return None
 
     except Exception as e:
-        logger.error(f"❌ Exceção ao enviar imagem: {str(e)}")
+        logger.error(f"Exceção ao enviar imagem: {type(e).__name__}")
         return None
 
 
@@ -605,10 +620,10 @@ def get_thread_metadata(thread_id: str) -> dict:
                     delivery_id = sender.get("deliveryIdentifier", {})
                     if delivery_id:
                         metadata["visitor_delivery_identifier"] = delivery_id
-                    logger.info(f"👤 Visitante encontrado: {actor_id}")
+                    logger.info(f"Visitante encontrado: {actor_id}")
 
     if not metadata["visitor_actor_id"]:
-        logger.warning(f"⚠️ Visitante não encontrado em {len(messages)} mensagens")
+        logger.warning(f"Visitante não encontrado em {len(messages)} mensagens")
 
     return metadata
 
@@ -628,11 +643,11 @@ def reply_to_visitor(thread_id: str, response_text: str) -> Optional[dict]:
     metadata = get_thread_metadata(thread_id)
 
     if not metadata["channel_id"] or not metadata["channel_account_id"]:
-        logger.error("❌ Não foi possível obter metadados do canal")
+        logger.error("Não foi possível obter metadados do canal")
         return None
 
     if not metadata["visitor_actor_id"]:
-        logger.error("❌ Não foi possível identificar o visitante")
+        logger.error("Não foi possível identificar o visitante")
         return None
 
     recipients = [{
@@ -673,7 +688,7 @@ def get_ticket_owner(ticket_id: str) -> Optional[str]:
             return props.get("hubspot_owner_id")
         return None
     except Exception as e:
-        logger.error(f"❌ Erro ao obter proprietário: {str(e)}")
+        logger.error(f"Erro ao obter proprietário: {type(e).__name__}")
         return None
 
 
@@ -699,13 +714,13 @@ def update_ticket_owner(ticket_id: str, owner_id: str = None) -> bool:
         response = requests.patch(url, headers=get_headers(), json=payload, timeout=30)
 
         if response.status_code == 200:
-            logger.info(f"✅ Proprietário do ticket {ticket_id} atualizado")
+            logger.info(f"Proprietário do ticket {ticket_id} atualizado")
             return True
         else:
-            logger.error(f"❌ Erro ao atualizar proprietário: {response.status_code}")
+            logger.error(f"Erro ao atualizar proprietário: {response.status_code}")
             return False
     except Exception as e:
-        logger.error(f"❌ Exceção ao atualizar proprietário: {str(e)}")
+        logger.error(f"Exceção ao atualizar proprietário: {type(e).__name__}")
         return False
 
 
@@ -732,13 +747,13 @@ def update_ticket_pipeline_status(ticket_id: str, pipeline_id: str, stage_id: st
         response = requests.patch(url, headers=get_headers(), json=payload, timeout=30)
 
         if response.status_code == 200:
-            logger.info(f"✅ Ticket {ticket_id} movido para pipeline {pipeline_id} / status {stage_id}")
+            logger.info(f"Ticket {ticket_id} movido para pipeline {pipeline_id} / status {stage_id}")
             return True
         else:
-            logger.error(f"❌ Erro ao mover ticket: {response.status_code} - {response.text}")
+            logger.error(f"Erro ao mover ticket: {response.status_code}")
             return False
     except Exception as e:
-        logger.error(f"❌ Exceção ao mover ticket: {str(e)}")
+        logger.error(f"Exceção ao mover ticket: {type(e).__name__}")
         return False
 
 
@@ -753,7 +768,7 @@ def transfer_to_human(ticket_id: str) -> bool:
     Returns:
         True se sucesso, False caso contrário
     """
-    logger.info(f"🔄 Transferindo ticket {ticket_id} para humano...")
+    logger.info(f"Transferindo ticket {ticket_id} para humano...")
 
     # Remove o proprietário
     owner_cleared = update_ticket_owner(ticket_id, None)
@@ -762,14 +777,14 @@ def transfer_to_human(ticket_id: str) -> bool:
     moved = update_ticket_pipeline_status(ticket_id, HUMAN_PIPELINE, HUMAN_STATUS)
 
     if owner_cleared and moved:
-        logger.info(f"✅ Ticket {ticket_id} transferido para humano com sucesso")
+        logger.info(f"Ticket {ticket_id} transferido para humano com sucesso")
         return True
     else:
-        logger.error(f"❌ Falha ao transferir ticket {ticket_id} para humano")
+        logger.error(f"Falha ao transferir ticket {ticket_id} para humano")
         return False
 
 
-def get_tickets_for_salomao() -> List[dict]:
+def get_tickets_for_salomao(*, strict: bool = False) -> List[dict]:
     """
     Busca tickets que o Salomão deve processar.
     Filtros: Pipeline do Salomão + Status do Salomão + Proprietário do Salomão (81908844)
@@ -822,14 +837,20 @@ def get_tickets_for_salomao() -> List[dict]:
         if response.status_code == 200:
             data = response.json()
             tickets = data.get("results", [])
-            logger.info(f"✅ Encontrados {len(tickets)} tickets para o Salomão")
+            logger.debug("Tickets elegiveis encontrados", extra={"event": "tickets.searched", "ticket_count": len(tickets)})
             return tickets
         else:
-            logger.error(f"❌ Erro ao buscar tickets: {response.status_code}")
+            logger.error("Falha ao consultar tickets", extra={"event": "tickets.search_failed", "status_code": response.status_code})
+            if strict:
+                raise HubSpotReadError("ticket_search_unavailable")
             return []
 
+    except HubSpotReadError:
+        raise
     except Exception as e:
-        logger.error(f"❌ Exceção ao buscar tickets: {str(e)}")
+        logger.exception("Falha ao consultar tickets", extra={"event": "tickets.search_failed"})
+        if strict:
+            raise HubSpotReadError("ticket_search_unavailable") from e
         return []
 
 
@@ -863,7 +884,7 @@ def get_contact_info(contact_id: str) -> Optional[dict]:
             }
         return None
     except Exception as e:
-        logger.error(f"❌ Erro ao buscar contato: {str(e)}")
+        logger.error(f"Erro ao buscar contato: {type(e).__name__}")
         return None
 
 
@@ -890,7 +911,7 @@ def get_ticket_contact(ticket_id: str) -> Optional[dict]:
                     return get_contact_info(str(contact_id))
         return None
     except Exception as e:
-        logger.error(f"❌ Erro ao buscar contato do ticket: {str(e)}")
+        logger.error(f"Erro ao buscar contato do ticket: {type(e).__name__}")
         return None
 
 

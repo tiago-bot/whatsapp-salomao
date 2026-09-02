@@ -12,11 +12,16 @@ import os
 import uuid
 import logging
 import asyncio
+import time
 from typing import Optional, List
 from datetime import datetime
 from contextlib import asynccontextmanager
 from contextlib import suppress
 from config import HUBSPOT_POLLING_ENABLED, HUBSPOT_POLLING_INTERVAL
+from logging_config import configure_logging, log_context
+from scope_policy import SCOPE_POLICY_VERSION
+
+configure_logging()
 
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -44,11 +49,6 @@ from hubspot_database import hubspot_db
 from salomao_agent import salomao
 from database import db
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s | %(levelname)s | %(message)s',
-    datefmt='%H:%M:%S'
-)
 logger = logging.getLogger('salomao.api')
 
 POLLING_INTERVAL = HUBSPOT_POLLING_INTERVAL
@@ -66,31 +66,39 @@ async def polling_loop():
     global polling_active
     owner_id = SALOMAO_ACTOR_ID.replace("A-", "")
 
-    logger.info(f"🔄 Polling iniciado - intervalo: {POLLING_INTERVAL}s")
-    logger.info(f"🎯 Filtros ativos:")
-    logger.info(f"   Pipeline: {SALOMAO_PIPELINE}")
-    logger.info(f"   Status: {SALOMAO_STATUS}")
-    logger.info(f"   Proprietário: {owner_id}")
+    logger.info("Busca automatica iniciada", extra={"event": "polling.started", "interval_seconds": POLLING_INTERVAL,
+        "pipeline_id": SALOMAO_PIPELINE, "stage_id": SALOMAO_STATUS, "owner_id": owner_id})
+    previous_state, last_report = None, 0.0
 
     while polling_active:
         try:
             # Busca tickets com os 3 filtros (já filtrado na API)
-            tickets = await asyncio.to_thread(get_tickets_for_salomao)
+            tickets = await asyncio.to_thread(get_tickets_for_salomao, strict=True)
 
+            responses, errors = 0, 0
+            reasons = set()
             if tickets:
-                logger.info(f"📬 {len(tickets)} ticket(s) para processar")
-
                 for ticket in tickets:
                     ticket_id = ticket.get("id")
                     try:
-                        result = await asyncio.to_thread(process_single_ticket, ticket_id)
-                        if result.get("responses"):
-                            logger.info(f"✅ Ticket {ticket_id}: {len(result['responses'])} resposta(s)")
+                        with log_context(ticket_id=str(ticket_id), source="polling"):
+                            result = await asyncio.to_thread(process_single_ticket, ticket_id)
+                        responses += sum(bool(r.get("sent")) for r in result.get("responses", []))
+                        if result.get("error") or not result.get("success", True):
+                            errors += 1
+                            reasons.add(result.get("reason") or result.get("error") or "processing_failed")
                     except Exception as e:
-                        logger.error(f"❌ Erro no ticket {ticket_id}: {e}")
+                        errors += 1
+                        logger.exception("Falha no processamento do ticket", extra={"event": "ticket.failed", "ticket_id": str(ticket_id)})
+            state = (tuple(str(t.get("id")) for t in tickets), tuple(sorted(reasons)), errors)
+            if state != previous_state or responses or time.monotonic() - last_report >= 60:
+                logger.log(logging.WARNING if errors else logging.INFO, "Resumo da busca automatica", extra={
+                    "event": "polling.summary", "ticket_count": len(tickets), "response_count": responses,
+                    "error_count": errors, "reason": ",".join(sorted(reasons)) or None})
+                previous_state, last_report = state, time.monotonic()
 
         except Exception as e:
-            logger.error(f"❌ Erro no polling: {e}")
+            logger.exception("Falha no ciclo de busca", extra={"event": "polling.failed"})
 
         await asyncio.sleep(POLLING_INTERVAL)
 
@@ -101,8 +109,7 @@ async def lifespan(app: FastAPI):
     global polling_active
     polling_active = HUBSPOT_POLLING_ENABLED
     task = asyncio.create_task(polling_loop()) if polling_active else None
-    logger.info("🚀 Salomão HubSpot Bot iniciado!")
-    logger.info("Polling %s (Pipeline + Status + Proprietário)", "ativo" if polling_active else "desativado")
+    logger.info("Servico iniciado", extra={"event": "service.started", "polling_enabled": polling_active, "scope_policy_version": SCOPE_POLICY_VERSION})
     yield
     # Shutdown
     polling_active = False
@@ -110,7 +117,7 @@ async def lifespan(app: FastAPI):
         task.cancel()
         with suppress(asyncio.CancelledError):
             await task
-    logger.info("🛑 Salomão HubSpot Bot encerrado")
+    logger.info("Servico encerrado", extra={"event": "service.stopped"})
 
 
 app = FastAPI(
@@ -162,6 +169,7 @@ async def root():
 async def health_check():
     return {
         "status": "healthy",
+        "scope_policy_version": SCOPE_POLICY_VERSION,
         "timestamp": datetime.utcnow().isoformat()
     }
 
@@ -212,7 +220,7 @@ async def process_all_tickets_endpoint(background_tasks: BackgroundTasks):
             try:
                 await asyncio.to_thread(process_single_ticket, ticket_id)
             except Exception as e:
-                logger.error(f"❌ Erro ao processar ticket {ticket_id}: {e}")
+                logger.error(f"Erro ao processar ticket {ticket_id}: {type(e).__name__}")
 
     background_tasks.add_task(process_all)
 
@@ -314,7 +322,7 @@ async def hubspot_webhook(request: Request, background_tasks: BackgroundTasks):
     """
     try:
         body = await request.json()
-        logger.info(f"📥 Webhook recebido")
+        logger.info(f"Webhook recebido")
 
         events = body if isinstance(body, list) else [body]
 
@@ -322,19 +330,19 @@ async def hubspot_webhook(request: Request, background_tasks: BackgroundTasks):
             subscription_type = event.get("subscriptionType", "")
             object_id = str(event.get("objectId", ""))
 
-            logger.info(f"📌 Evento: {subscription_type} | ID: {object_id}")
+            logger.info(f"Evento: {subscription_type} | ID: {object_id}")
 
             # conversation.newMessage - Nova mensagem em conversa
             if subscription_type == "conversation.newMessage":
                 thread_id = object_id
-                logger.info(f"💬 Nova mensagem no thread: {thread_id}")
+                logger.info(f"Nova mensagem no thread: {thread_id}")
                 background_tasks.add_task(process_message_if_valid, thread_id)
                 continue
 
             # conversation.creation - Nova conversa criada
             if subscription_type == "conversation.creation":
                 thread_id = object_id
-                logger.info(f"🆕 Nova conversa: {thread_id}")
+                logger.info(f"Nova conversa: {thread_id}")
                 background_tasks.add_task(process_message_if_valid, thread_id)
                 continue
 
@@ -343,7 +351,7 @@ async def hubspot_webhook(request: Request, background_tasks: BackgroundTasks):
                 ticket_id = object_id
                 property_name = event.get("propertyName", "")
                 property_value = event.get("propertyValue", "")
-                logger.info(f"🎫 Ticket {ticket_id} mudou: {property_name} = {property_value}")
+                logger.debug("Propriedade do ticket alterada", extra={"event": "webhook.ticket_changed", "ticket_id": ticket_id})
 
                 # O valor desta propriedade é a data de entrada, NÃO o ID do
                 # status. Revalidar pipeline/status/proprietário no ticket.
@@ -351,56 +359,33 @@ async def hubspot_webhook(request: Request, background_tasks: BackgroundTasks):
                     background_tasks.add_task(process_ticket_if_valid, ticket_id)
                 continue
 
-            logger.debug(f"⏭️ Evento ignorado: {subscription_type}")
+            logger.debug(f"Evento ignorado: {subscription_type}")
 
         return {"status": "ok", "received": len(events)}
 
     except Exception as e:
-        logger.error(f"❌ Erro webhook: {str(e)}")
+        logger.error(f"Erro webhook: {type(e).__name__}")
         return {"status": "error", "message": str(e)}
 
 
 async def process_ticket_if_valid(ticket_id: str):
-    """
-    Processa um ticket APENAS se atender os 3 filtros:
-    1. Pipeline do Salomão
-    2. Status do Salomão
-    3. Proprietário = Salomão
-    """
-    try:
-        ticket = get_ticket_by_id(ticket_id)
-        if not ticket:
-            logger.debug(f"⏭️ Ticket {ticket_id} não encontrado")
-            return
-
-        props = ticket.get("properties", {})
-        pipeline = props.get("hs_pipeline", "")
-        stage = props.get("hs_pipeline_stage", "")
-        owner = props.get("hubspot_owner_id", "")
-
-        owner_id_expected = SALOMAO_ACTOR_ID.replace("A-", "")
-
-        # Verifica os 3 filtros
-        if pipeline != SALOMAO_PIPELINE:
-            logger.debug(f"⏭️ Ticket {ticket_id}: pipeline {pipeline} != {SALOMAO_PIPELINE}")
-            return
-
-        if stage != SALOMAO_STATUS:
-            logger.debug(f"⏭️ Ticket {ticket_id}: status {stage} != {SALOMAO_STATUS}")
-            return
-
-        if owner != owner_id_expected:
-            logger.debug(f"⏭️ Ticket {ticket_id}: owner {owner} != {owner_id_expected}")
-            return
-
-        # Passou nos 3 filtros - processa
-        logger.info(f"✅ Ticket {ticket_id} passou nos 3 filtros - processando...")
-        result = await asyncio.to_thread(process_single_ticket, ticket_id)
-        if result.get("responses"):
-            logger.info(f"✅ Ticket {ticket_id}: {len(result['responses'])} resposta(s) enviada(s)")
-
-    except Exception as e:
-        logger.error(f"❌ Erro ao processar ticket {ticket_id}: {e}")
+    """Webhook usa os mesmos filtros e o mesmo processamento do polling."""
+    with log_context(ticket_id=str(ticket_id), source="webhook"):
+        try:
+            ticket = await asyncio.to_thread(get_ticket_by_id, ticket_id)
+            reason = hubspot_bot._ineligible_reason(ticket)
+            if reason:
+                logger.info("Ticket nao processado pelo webhook", extra={"event": "webhook.filtered", "reason": reason})
+                return
+            result = await asyncio.to_thread(process_single_ticket, ticket_id)
+            filtered = bool(result.get("reason"))
+            failed = not result.get("success", False) and not filtered
+            logger.log(logging.WARNING if failed else logging.INFO, "Processamento do webhook concluido", extra={
+                "event": "webhook.processed", "reason": result.get("reason") or ("processing_failed" if failed else None),
+                "response_count": sum(bool(r.get("sent")) for r in result.get("responses", [])),
+                "error_count": int(failed)})
+        except Exception:
+            logger.exception("Falha ao processar webhook", extra={"event": "webhook.failed"})
 
 
 async def process_message_if_valid(thread_id: str):
@@ -408,22 +393,22 @@ async def process_message_if_valid(thread_id: str):
     Processa mensagem de um thread APENAS se o ticket associado atender os 3 filtros.
     """
     try:
-        thread = get_thread_by_id(thread_id)
+        thread = await asyncio.to_thread(get_thread_by_id, thread_id)
         if not thread:
-            logger.debug(f"⏭️ Thread {thread_id} não encontrado")
+            logger.debug(f"Thread {thread_id} não encontrado")
             return
 
         # Busca ticket associado
         associated_ticket_id = thread.get("associatedTicketId")
         if not associated_ticket_id:
-            logger.debug(f"⏭️ Thread {thread_id} sem ticket associado")
+            logger.debug(f"Thread {thread_id} sem ticket associado")
             return
 
         # Verifica se o ticket passa nos filtros
         await process_ticket_if_valid(associated_ticket_id)
 
     except Exception as e:
-        logger.error(f"❌ Erro ao processar thread {thread_id}: {e}")
+        logger.error(f"Erro ao processar thread {thread_id}: {type(e).__name__}")
 
 
 async def create_session_for_conversation(thread_id: str):
@@ -432,12 +417,12 @@ async def create_session_for_conversation(thread_id: str):
     Busca informações do contato para melhor interação.
     """
     try:
-        logger.info(f"📝 Criando sessão para conversa {thread_id}")
+        logger.info(f"Criando sessão para conversa {thread_id}")
 
         # Busca informações do thread
         thread = get_thread_by_id(thread_id)
         if not thread:
-            logger.warning(f"⚠️ Thread {thread_id} não encontrado")
+            logger.warning(f"Thread {thread_id} não encontrado")
             return
 
         # Busca ticket associado
@@ -454,7 +439,7 @@ async def create_session_for_conversation(thread_id: str):
             if contact:
                 visitor_name = f"{contact.get('firstname', '')} {contact.get('lastname', '')}".strip()
                 visitor_email = contact.get('email')
-                logger.info(f"👤 Contato encontrado: {visitor_name} ({visitor_email})")
+                logger.info("Contato associado localizado", extra={"event": "contact.found"})
 
         # Busca visitor_actor_id das mensagens
         messages = get_thread_messages(thread_id, limit=5)
@@ -477,10 +462,10 @@ async def create_session_for_conversation(thread_id: str):
             visitor_email=visitor_email
         )
 
-        logger.info(f"✅ Sessão criada: {session.get('session_id')}")
+        logger.info(f"Sessão criada: {session.get('session_id')}")
 
     except Exception as e:
-        logger.error(f"❌ Erro ao criar sessão: {str(e)}")
+        logger.error(f"Erro ao criar sessão: {type(e).__name__}")
 
 
 @app.post("/ticket/{ticket_id}/transfer-to-human")
