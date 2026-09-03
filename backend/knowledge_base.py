@@ -131,6 +131,27 @@ class KnowledgeBase:
 
         return articles
 
+    def search_referenced(self, urls: list[str]) -> list[dict]:
+        """Refresh cited articles from the trusted catalog/index, not the web."""
+        catalog = published_knowledge.by_url()
+        found = [catalog[url] for url in urls if url in catalog]
+        for url in urls:
+            if url in catalog:
+                continue
+            # Legacy deployments may have no published Supabase catalog configured.
+            # Restrict the semantic index lookup to the exact official article.
+            results = self.index.query(vector=self._get_embedding(url), top_k=8,
+                filter={"article_url": {"$eq": url}}, include_metadata=True)
+            chunks = [match.metadata for match in results.matches
+                      if (match.metadata or {}).get("article_url") == url]
+            if chunks:
+                first = chunks[0]
+                found.append({"id": str(first.get("article_id") or url),
+                    "title": first.get("article_title", "Documentação inChurch"), "url": url,
+                    "content": "\n\n".join(dict.fromkeys(c.get("text", "") for c in chunks)),
+                    "category": first.get("category_name", ""), "retrieval": "previous_source"})
+        return found
+
     def search_with_context(
         self,
         query: str,

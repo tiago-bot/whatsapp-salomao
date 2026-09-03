@@ -31,4 +31,6 @@ INRADAR_AUTH_TOKEN = os.getenv("INRADAR_AUTH_TOKEN")
 WHATSAPP_MAX_MESSAGE_LENGTH = min(4096, max(256, int(os.getenv("WHATSAPP_MAX_MESSAGE_LENGTH", "3500"))))
 HUBSPOT_POLLING_ENABLED = os.getenv("HUBSPOT_POLLING_ENABLED", "true").lower() in {"1", "true", "yes"}
 HUBSPOT_POLLING_INTERVAL = max(5, int(os.getenv("HUBSPOT_POLLING_INTERVAL", "10")))
+HUBSPOT_MESSAGE_DEBOUNCE_SECONDS = min(30, max(0, int(os.getenv("HUBSPOT_MESSAGE_DEBOUNCE_SECONDS", "5"))))
 DELIVERY_DB_PATH = os.getenv("DELIVERY_DB_PATH", str(Path(__file__).parent / ".local" / "delivery.sqlite3"))
+SUPABASE_CONVERSATION_MEMORY_ENABLED = os.getenv("SUPABASE_CONVERSATION_MEMORY_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}

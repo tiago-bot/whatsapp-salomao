@@ -44,6 +44,10 @@ class HubSpotReadError(RuntimeError):
     """A missing/partial history must not be mistaken for a new conversation."""
 
 
+class HubSpotSendRejected(RuntimeError):
+    """No message was accepted; a later attempt is safe."""
+
+
 def get_headers() -> dict:
     """Retorna headers para requisições à API do HubSpot."""
     return {
@@ -411,7 +415,7 @@ def send_message_to_thread(
         text = format_whatsapp(text)
         if not text or message_length(text) > WHATSAPP_MAX_MESSAGE_LENGTH:
             logger.error("Mensagem vazia ou acima do limite; use split_whatsapp antes do envio")
-            return None
+            raise HubSpotSendRejected("invalid_message")
 
         payload = {
             "type": "MESSAGE",
@@ -423,15 +427,19 @@ def send_message_to_thread(
             "recipients": recipients
         }
 
-        response = requests.post(url, headers=get_headers(), json=payload, timeout=30)
+        response = requests.post(url, headers=get_headers(), json=payload, timeout=30, allow_redirects=False)
 
         if response.status_code in [200, 201]:
             logger.info(f"Mensagem enviada para thread {thread_id}")
             return response.json()
         else:
             logger.error(f"Erro ao enviar mensagem: {response.status_code}")
+            if response.status_code in {400, 401, 403, 404, 422, 429}:
+                raise HubSpotSendRejected("request_rejected")
             return None
 
+    except HubSpotSendRejected:
+        raise
     except Exception as e:
         logger.error(f"Exceção ao enviar mensagem: {type(e).__name__}")
         return None
@@ -644,11 +652,11 @@ def reply_to_visitor(thread_id: str, response_text: str) -> Optional[dict]:
 
     if not metadata["channel_id"] or not metadata["channel_account_id"]:
         logger.error("Não foi possível obter metadados do canal")
-        return None
+        raise HubSpotSendRejected("channel_metadata_unavailable")
 
     if not metadata["visitor_actor_id"]:
         logger.error("Não foi possível identificar o visitante")
-        return None
+        raise HubSpotSendRejected("visitor_unavailable")
 
     recipients = [{
         "actorId": metadata["visitor_actor_id"]

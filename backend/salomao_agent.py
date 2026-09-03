@@ -30,11 +30,11 @@ from config import (
 from database import db
 from event_service import analyze_event_visibility, fetch_event_details
 from knowledge_base import knowledge_base
-from published_knowledge import contextual_query, context_relevant_articles, excerpt, safe_url
+from published_knowledge import contextual_query, context_relevant_articles, previous_source_urls, excerpt, safe_url
 from response_template import RESPONSE_TEMPLATE, SUPPORT_CONVERSATION_INSTRUCTIONS
 from handoff import requests_human
 from whatsapp_formatting import format_whatsapp
-from conversation_context import bounded_history, format_history
+from conversation_context import bounded_history, format_history, format_agent_context
 from logging_config import configure_logging
 from scope_policy import (SCOPE_POLICY_VERSION, SCOPE_REDIRECT, SCOPE_CLARIFY, SCOPE_UNAVAILABLE,
                           explicit_external_request, obvious_external_answer)
@@ -265,6 +265,7 @@ class ImageScopeResult(BaseModel):
 class TextScopeResult(BaseModel):
     status: ImageScopeStatus = ImageScopeStatus.UNCERTAIN
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    resolved_question: str = Field(default="", max_length=700)
 
 
 class OutputScopeResult(BaseModel):
@@ -331,6 +332,11 @@ nao detalha esse procedimento'. Nao invente uma pergunta so para encerrar.
 Para assunto externo, explique em uma frase o foco no uso da plataforma.
 Seja conciso: uma orientacao simples precisa de poucos passos, sem apresentacao,
 menus extensos, sugestoes genericas ou encerramento automatico oferecendo ajuda.
+Em continuacoes, responda o detalhe pedido sobre o objeto em andamento: depois de
+cadastro de membro, 'quais sao os obrigatorios?' pede os campos desse cadastro.
+Releia a fonte enviada anteriormente e confirme os dados nela. Nao reinicie o
+tutorial, nao troque o modulo e nao transfira uma pergunta que a fonte responde.
+Se a orientacao anterior estiver errada, corrija-a com clareza e base na fonte.
 Para perguntas simples, prefira ate 180 palavras. Evite repetir regras ou
 descrever dois procedimentos completos se houver um caminho geral suficiente.
 Nao acrescente hipoteses de falha a uma pergunta de como fazer; explique o caminho
@@ -440,7 +446,15 @@ Nao resolva o problema da imagem. Apenas classifique o escopo.
 TEXT_SCOPE_INSTRUCTIONS = """
 Classifique a intencao da mensagem atual para o suporte da plataforma inChurch.
 Retorne somente JSON: {"status": "inchurch" | "uncertain" | "out_of_scope",
-"confidence": numero entre 0 e 1}.
+"confidence": numero entre 0 e 1, "resolved_question": string}.
+Em resolved_question, reescreva a pergunta atual de modo independente, resolvendo
+referencias pelo objetivo mais recente do CLIENTE. Exemplo: apos cadastrar membro,
+'quais sao os obrigatorios?' vira 'Quais campos sao obrigatorios no cadastro de
+membro?'. Preserve o detalhe pedido e as correcoes do cliente. Nao responda a
+pergunta, nao invente fatos e nao herde um assunto de uma resposta equivocada.
+Sem antecedente claro, retorne resolved_question vazia e uncertain. Uma mudanca
+explicita de assunto deve permanecer nova; nao reescreva curiosidade externa como
+suporte. Uma saudacao nao apaga o assunto em andamento.
 
 O cliente ja esta na central inChurch: nao exija que repita o nome da marca.
 Uso, acesso, cadastro, pedidos de oracao, conteudo, pessoas, eventos, cobrancas,
@@ -702,6 +716,7 @@ class SalomaoSupervisorAgent:
         image_mime_type: str | None = None,
         spreadsheet_context: str | None = None,
         message_count: int = 0,
+        resolved_question: str = "",
     ) -> SalomaoPipelineResponse:
         start = time.perf_counter()
         if requests_human(message):
@@ -714,7 +729,7 @@ class SalomaoSupervisorAgent:
         self.rag_agent.knowledge_tool.conversation_context = conversation_context
         triage = heuristic_triage(contextual_query(message, conversation_context))
         if self._can_use_fast_knowledge_path(triage, image_base64, event_context, spreadsheet_context):
-            return self._run_document_answer(message, conversation_context, triage)
+            return self._run_document_answer(message, conversation_context, triage, resolved_question)
         triage = self.triage_agent.classify(message, conversation_context=conversation_context)
         team_input = self._build_team_input(
             message=message,
@@ -805,20 +820,32 @@ class SalomaoSupervisorAgent:
             Rota.SUPORTE_TECNICO_N1,
         }
 
-    def _run_document_answer(self, message: str, history: str, triage: TriageResult) -> SalomaoPipelineResponse:
+    def _run_document_answer(self, message: str, history: str, triage: TriageResult, resolved_question: str = "") -> SalomaoPipelineResponse:
         global _answer_model_retry_at
         query = contextual_query(message, history)
+        if query == message and resolved_question and not explicit_external_request(resolved_question):
+            query = resolved_question
+        reference_urls = previous_source_urls(message, history)
+        referenced = []
+        if reference_urls:
+            try:
+                referenced = knowledge_base.search_referenced(reference_urls)
+            except Exception as exc:
+                logger.warning("Fonte anterior indisponivel", extra={"event": "knowledge.reference_unavailable", "error_type": type(exc).__name__})
         try:
             articles = knowledge_base.search(query, top_k=4)
             # Only expose verified official document links, never generated URLs.
             articles = [a for a in articles if a.get("content") and safe_url(a.get("url", ""))]
             articles = context_relevant_articles(articles, message, history)
+            referenced = context_relevant_articles(referenced, message, history)
+            combined = [a for a in referenced + articles if a.get("content") and safe_url(a.get("url", ""))]
+            articles = list({str(a["id"]): a for a in reversed(combined)}.values())[::-1][:4]
             logger.info("Busca de conhecimento concluida", extra={"event": "knowledge.retrieved",
                 "contextualized": query != message, "source_count": len(articles),
                 "source_ids": [str(a["id"]) for a in articles], "route": triage.rota.value})
         except Exception as exc:
             logger.warning("Recuperacao indisponivel | type=%s", type(exc).__name__)
-            articles = []
+            articles = context_relevant_articles(referenced, message, history)
 
         if time.monotonic() < _answer_model_retry_at:
             return self._documentation_response(articles, query, triage)
@@ -838,7 +865,7 @@ class SalomaoSupervisorAgent:
             content = getattr(response, "content", None)
             answer = GroundedAnswer.model_validate(content) if isinstance(content, dict) else GroundedAnswer.model_validate_json(content)
             sources = [{"id": a["id"], "title": a["title"], "url": a["url"]}
-                       for a in articles if a["id"] in answer.source_ids]
+                       for a in articles if str(a["id"]) in answer.source_ids]
             # A procedural answer without evidence must never reach the customer.
             if not sources and not answer.needs_clarification and not answer.insufficient_knowledge:
                 return self._documentation_response(articles, query, triage)
@@ -1163,7 +1190,7 @@ class SalomaoAgent:
     def _guard_model():
         kwargs = _openai_kwargs()
         kwargs["client_params"] = {**kwargs.get("client_params", {}), "timeout": 10.0, "max_retries": 0}
-        return OpenAIChat(id=DEFAULT_MINI_MODEL, max_completion_tokens=250, **kwargs)
+        return OpenAIChat(id=DEFAULT_MINI_MODEL, max_completion_tokens=800, **kwargs)
 
     def validate_response_scope(self, message: str, response: str, history: str = "") -> bool:
         """Fail closed: only explicitly approved output may leave the agent."""
@@ -1176,7 +1203,8 @@ class SalomaoAgent:
             run = Agent(name="OutputScopeGuard", model=self._guard_model(),
                 instructions=OUTPUT_SCOPE_INSTRUCTIONS, use_json_mode=True,
                 parse_response=False, markdown=False, telemetry=False).run(json.dumps({
-                    "question": message, "recent_history": history, "candidate_response": response}, ensure_ascii=False))
+                    "question": message, "resolved_question": contextual_query(message, history),
+                    "recent_history": history, "candidate_response": response}, ensure_ascii=False))
             if SalomaoSupervisorAgent._run_failed(run):
                 return False
             content = getattr(run, "content", None)
@@ -1445,8 +1473,7 @@ class SalomaoAgent:
                 audio_transcription = self.transcribe_audio(base64.b64decode(audio_base64, validate=True), audio_format)
                 if not audio_transcription.strip():
                     raise ValueError("empty_transcription")
-                if not message:
-                    message = audio_transcription
+                message = "\n".join(filter(None, [message, audio_transcription]))
             except Exception as exc:
                 logger.warning("Audio invalido: %s", _sanitize_error(exc))
                 return {
@@ -1465,11 +1492,9 @@ class SalomaoAgent:
         if conversation_history is not None:
             # HubSpot is authoritative for what was actually said and delivered.
             # Supabase may contain drafts, stale turns or writes that failed.
-            selected_history, truncated = bounded_history(conversation_history)
-            conversation_context = format_history(selected_history)
-            message_count = len(selected_history)
+            conversation_context, message_count, truncated = format_agent_context(conversation_history)
             logger.info("Historico efetivo selecionado", extra={"event": "agent.context", "source": "channel",
-                "context_messages": len(selected_history), "context_chars": len(conversation_context), "context_truncated": truncated})
+                "context_messages": message_count, "context_chars": len(conversation_context), "context_truncated": truncated})
         else:
             conversation_context = self._get_conversation_context(session_id)
         if image_base64:
@@ -1568,6 +1593,7 @@ class SalomaoAgent:
             message=effective_message,
             conversation_context=conversation_context,
             event_context=event_context,
+            resolved_question=text_scope.resolved_question,
             audio_transcription=audio_transcription,
             image_base64=image_base64,
             image_mime_type=image_mime_type,

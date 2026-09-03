@@ -4,10 +4,12 @@ Confirmed parts are never resent. A crash/timeout between remote acceptance and
 local confirmation still requires reconciliation (HubSpot has no idempotency key).
 """
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 import sqlite3
 from contextlib import contextmanager
 from conversation_context import message_time
+from process_lock import thread_lock
 
 
 class DeliveryStore:
@@ -15,6 +17,7 @@ class DeliveryStore:
         self.path = str(path)
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
+            conn.execute("PRAGMA synchronous=FULL")
             conn.execute("""CREATE TABLE IF NOT EXISTS deliveries (
                 thread_id TEXT NOT NULL, message_id TEXT NOT NULL,
                 payload TEXT NOT NULL, sent_parts INTEGER NOT NULL DEFAULT 0,
@@ -24,6 +27,68 @@ class DeliveryStore:
                 thread_id TEXT NOT NULL, message_id TEXT NOT NULL, created_at TEXT NOT NULL,
                 role TEXT NOT NULL, content TEXT NOT NULL,
                 PRIMARY KEY (thread_id, message_id))""")
+            existing = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='delivery_attempts'").fetchone()
+            conn.execute("""CREATE TABLE IF NOT EXISTS delivery_attempts (
+                thread_id TEXT NOT NULL, message_id TEXT NOT NULL, part INTEGER NOT NULL,
+                state TEXT NOT NULL, attempted_at TEXT NOT NULL, remote_id TEXT,
+                PRIMARY KEY(thread_id,message_id,part))""")
+            if not existing:
+                # Old pending rows have no proof that their last POST failed.
+                conn.execute("""INSERT OR IGNORE INTO delivery_attempts
+                    (thread_id,message_id,part,state,attempted_at)
+                    SELECT thread_id,message_id,sent_parts,'uncertain',? FROM deliveries
+                    WHERE complete=0""", (datetime.now(timezone.utc).isoformat(),))
+
+    def thread_lock(self, thread_id):
+        return thread_lock(self.path, thread_id)
+
+    def restore_memory(self, thread_id, messages):
+        """Lost receipts cannot be reconstructed from conversation text alone."""
+        self.remember_messages(thread_id, messages)
+        with self._connect() as conn:
+            for message in messages:
+                if message.get("is_from_visitor") and message.get("id"):
+                    conn.execute("INSERT OR IGNORE INTO deliveries(thread_id,message_id,payload,complete) VALUES(?,?,?,1)",
+                        (str(thread_id), str(message["id"]), json.dumps({
+                            "blocked_reason": "restored_history_without_receipt_requires_review"})))
+
+    def begin_part(self, thread_id, message_id, part):
+        """Commit intent BEFORE sending. An interrupted intent is never replayed."""
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT complete,sent_parts FROM deliveries WHERE thread_id=? AND message_id=?",
+                               (thread_id, message_id)).fetchone()
+            if not row or row["complete"] or row["sent_parts"] > part:
+                return "confirmed"
+            if row["sent_parts"] != part:
+                return "out_of_order"
+            attempt = conn.execute("SELECT state FROM delivery_attempts WHERE thread_id=? AND message_id=? AND part=?",
+                                   (thread_id, message_id, part)).fetchone()
+            if attempt and attempt["state"] != "retryable":
+                return "uncertain"
+            conn.execute("""INSERT INTO delivery_attempts VALUES(?,?,?,?,?,NULL)
+                ON CONFLICT(thread_id,message_id,part) DO UPDATE SET state='sending',attempted_at=excluded.attempted_at""",
+                (thread_id, message_id, part, "sending", datetime.now(timezone.utc).isoformat()))
+        return "send"
+
+    def failed_part(self, thread_id, message_id, part, *, retryable=False):
+        with self._connect() as conn:
+            conn.execute("UPDATE delivery_attempts SET state=? WHERE thread_id=? AND message_id=? AND part=? AND state='sending'",
+                ("retryable" if retryable else "uncertain", thread_id, message_id, part))
+
+    def confirm_delivery_part(self, thread_id, message_id, part, sent, text):
+        """Receipt, progress and delivered context share one durable transaction."""
+        remote_id = sent.get("id")
+        if not remote_id:
+            raise ValueError("missing_delivery_receipt")
+        timestamp = message_time(sent.get("createdAt")) or datetime.now(timezone.utc)
+        with self._connect() as conn:
+            conn.execute("UPDATE delivery_attempts SET state='confirmed',remote_id=? WHERE thread_id=? AND message_id=? AND part=?",
+                (str(remote_id), thread_id, message_id, part))
+            conn.execute("UPDATE deliveries SET sent_parts=MAX(sent_parts,?) WHERE thread_id=? AND message_id=?",
+                (part + 1, thread_id, message_id))
+            conn.execute("INSERT OR IGNORE INTO conversation_messages VALUES(?,?,?,?,?)",
+                (str(thread_id), str(remote_id), timestamp.isoformat(), "assistant", text))
 
     @contextmanager
     def _connect(self):
@@ -48,6 +113,10 @@ class DeliveryStore:
         with self._connect() as conn:
             conn.execute("INSERT OR IGNORE INTO deliveries(thread_id,message_id,payload) VALUES(?,?,?)",
                          (thread_id, message_id, json.dumps(payload, ensure_ascii=False)))
+            for input_id in payload.get("source_message_ids", []):
+                if str(input_id) != str(message_id):
+                    conn.execute("INSERT OR IGNORE INTO deliveries(thread_id,message_id,payload,complete) VALUES(?,?,?,1)",
+                        (thread_id, str(input_id), json.dumps({"coalesced_into": str(message_id)})))
         return self.get(thread_id, message_id)
 
     def pending(self, thread_id):

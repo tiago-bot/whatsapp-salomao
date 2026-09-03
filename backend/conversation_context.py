@@ -44,6 +44,26 @@ def format_history(messages):
                      " ".join(m["content"].split()) for m in history)
 
 
+def format_agent_context(messages):
+    """Retain the customer's active objective even beyond the recent window."""
+    from published_knowledge import contextual_query
+    selected, truncated = bounded_history(messages)
+    recent = format_history(selected)
+    older = "\n".join(("Cliente: " if m.get("role") == "user" else "Salomao: ") +
+        " ".join(str(m.get("content") or "").split())[:MAX_MESSAGE_CHARS]
+        for m in messages[-100:] if m.get("role") in {"user", "assistant"})
+    goal = contextual_query("", older).strip()[:1600]
+    retained = bool(goal and goal not in recent)
+    if retained:
+        # An extracted customer objective, not an assistant-generated fact.
+        prefix = "Cliente: " + goal + "\n"
+        while selected and len(prefix) + len(recent) > MAX_CONTEXT_CHARS:
+            selected.pop(0)
+            recent = format_history(selected)
+        recent = prefix + recent
+    return recent, len(selected) + int(retained), truncated
+
+
 def history_before(messages, current):
     """Only messages preceding the current input, never another queued turn."""
     cutoff = message_time(current.get("created_at"))

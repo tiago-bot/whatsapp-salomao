@@ -26,7 +26,7 @@ class FormattingTests(unittest.TestCase):
         self.assertNotIn("##", out)
         self.assertNotIn("**", out)
         self.assertIn("*Configurar evento*", out)
-        self.assertIn("1. Abra *Eventos*.\n\n2. Toque em *Editar*.", out)
+        self.assertIn("1. Abra *Eventos*.\n2. Toque em *Editar*.", out)
         self.assertIn("Fonte: Ajuda\nhttps://portal.inchurch.com.br/pt-br/evento", out)
         self.assertEqual(format_whatsapp(out), out)
 
@@ -131,7 +131,7 @@ class DeliveryTests(unittest.TestCase):
 
     def test_partial_failure_retries_only_missing_part_after_restart(self):
         entry = self.enqueue()
-        with patch.object(bot_module, "reply_to_visitor", side_effect=[{"id": "sent1"}, None]) as send:
+        with patch.object(bot_module, "reply_to_visitor", side_effect=[{"id": "sent1"}, bot_module.HubSpotSendRejected()]) as send:
             self.assertFalse(self.bot._deliver(entry, "ticket")["sent"])
             self.assertEqual(send.call_count, 2)
         restarted = bot_module.HubSpotSalomaoBot(DeliveryStore(self.path), self.agent)

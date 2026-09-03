@@ -12,6 +12,7 @@ from collections import Counter
 from difflib import get_close_matches, SequenceMatcher
 from threading import Lock
 from urllib.parse import urlparse
+from scope_policy import explicit_external_request
 
 import httpx
 from config import KB_SUPABASE_URL, KB_SUPABASE_ANON_KEY
@@ -56,12 +57,14 @@ def contextual_query(query: str, history: str) -> str:
     Historical assistant guesses are not a topic authority. Explicit subject
     changes win; wording order/length alone must not turn a refund into cells.
     """
-    if not history:
+    if not history or explicit_external_request(query):
         return query
 
     def follows(text, anchor, assistant):
         normalized = normalize(text).strip()
         current = set(terms(text))
+        if explicit_external_request(text):
+            return False
         if re.match(r"^(mudando de assunto|outra (duvida|pergunta)|agora (quero|preciso))\b", normalized):
             return False
         choice = ("?" in assistant and bool(current) and current.issubset(set(terms(assistant))) and
@@ -72,6 +75,14 @@ def contextual_query(query: str, history: str) -> str:
         # 'Não consigo criar evento' after refunds is a new explicit request.
         if current & SUBJECTS and not (current & SUBJECTS & set(terms(anchor))):
             return False
+        # Attribute questions inherit the active object: required fields, price,
+        # deadline, permissions, etc. They are not independent search topics.
+        if re.search(r"\b(obrigatorio[sa]?|obrigatorios|campos?|preencher|preenchimento|prazo|demora|permissoes|permissao|limite|opcional|opcionais)\b", normalized):
+            return bool(set(terms(anchor)) & SUBJECTS)
+        # A short follow-up can quote a detail from the last answer without
+        # naming the original object ('e telefone?', 'e a data de nascimento?').
+        if current and current.issubset(set(terms(assistant))) and len(current) <= 5:
+            return bool(set(terms(anchor)) & SUBJECTS)
         return (not current or bool(re.match(r"^(e\b|nao\b|sim\b)", normalized)) or
                 bool(re.search(r"\b(botao|opcao|isso|essa|esse|ele|ela|aqui|sumiu|aparece|"
                                r"consegui|funcionou|continua|deu certo|tentei|fiz)\b", normalized)))
@@ -91,6 +102,18 @@ def contextual_query(query: str, history: str) -> str:
         else:
             anchor = content
     return f"{anchor} {query}" if anchor and follows(query, anchor, assistant) else query
+
+
+def previous_source_urls(query: str, history: str) -> list[str]:
+    """References are hints to re-fetch, never evidence by themselves."""
+    if contextual_query(query, history) == query:
+        return []
+    # Only the last answer, not links from a previous unrelated subject.
+    replies = re.findall(r"^Salomao: (.+)$", history, flags=re.MULTILINE)
+    if not replies:
+        return []
+    return list(dict.fromkeys(url.rstrip(').,]') for url in re.findall(r"https://[^\s<>]+", replies[-1])
+                              if safe_url(url.rstrip(').,]'))))[:3]
 
 
 def context_relevant_articles(articles, query, history):

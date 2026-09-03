@@ -1,5 +1,9 @@
 # Continuidade de conversa e logs
 
+A revisão posterior do caso "quais são os obrigatórios?", incluindo memória no
+Supabase e retenção de envios incertos, está em [context-memory-idempotency.md](context-memory-idempotency.md).
+A situação real de imagem/áudio está em [multimodal-readiness.md](multimodal-readiness.md).
+
 ## Correções locais de 02/09/2026
 
 O incidente analisado foi uma continuação de estorno ("o botão não aparece")

@@ -12,6 +12,7 @@ if __name__ == "__main__":
         "PINECONE_HOST": "https://test.svc.example.com",
         "SUPABASE_URL": "https://test.supabase.co", "SUPABASE_KEY": "test-key",
         "HUBSPOT_ACCESS_TOKEN": "test-key", "HUBSPOT_POLLING_ENABLED": "false",
+        "HUBSPOT_MESSAGE_DEBOUNCE_SECONDS": "0",
         "AGNO_TELEMETRY": "false",
     })
     original_connect = socket.socket.connect
@@ -27,6 +28,8 @@ if __name__ == "__main__":
         suite = unittest.defaultTestLoader.loadTestsFromNames([
             "test_scope_regressions", "test_grounded_answers", "test_whatsapp", "test_api_contract",
             "test_conversation_continuity", "test_logging", "test_strict_scope",
+            "test_context_and_delivery_v2",
+            "test_message_debounce",
         ])
         result = unittest.TextTestRunner(verbosity=2).run(suite)
     raise SystemExit(0 if result.wasSuccessful() else 1)

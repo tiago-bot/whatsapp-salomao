@@ -93,12 +93,13 @@ def format_whatsapp(text: str) -> str:
                 i += 1
             continue
         line = lines[i].rstrip()
-        if re.match(r"^(?:\d+\. |[1-9]️⃣|🔟)", line) and output and output[-1]:
-            output.append("")
         output.append(line)
         i += 1
     text = re.sub(r"\n[ \t]+\n", "\n\n", "\n".join(output))
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    # Keep short consecutive steps together on mobile. Paragraphs and longer
+    # explanations retain their separation; formatting remains idempotent.
+    text = re.sub(r"(?m)^((?:\d+\. |[-] )[^\n]{1,180})\n\n(?=(?:\d+\. |[-] ))", r"\1\n", text)
     for n, value in enumerate(protected):
         text = text.replace(f"\ue000{n}\ue001", value)
     return text

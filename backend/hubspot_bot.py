@@ -10,9 +10,11 @@ import time
 
 import requests
 
-from config import DELIVERY_DB_PATH, WHATSAPP_MAX_MESSAGE_LENGTH
+from config import (DELIVERY_DB_PATH, WHATSAPP_MAX_MESSAGE_LENGTH, SUPABASE_CONVERSATION_MEMORY_ENABLED,
+                    HUBSPOT_MESSAGE_DEBOUNCE_SECONDS)
+from conversation_memory import SupabaseConversationMemory
 from delivery_store import DeliveryStore
-from conversation_context import bounded_history, history_before
+from conversation_context import bounded_history, history_before, message_time
 from logging_config import log_context
 from salomao_agent import salomao
 from whatsapp_formatting import format_whatsapp, split_whatsapp
@@ -23,7 +25,7 @@ from hubspot_service import (
     get_thread_messages, parse_incoming_messages, reply_to_visitor,
     transfer_ticket_to_human_support, SALOMAO_PIPELINE, SALOMAO_STATUS,
     SALOMAO_ACTOR_ID, get_headers,
-    HubSpotReadError,
+    HubSpotReadError, HubSpotSendRejected,
 )
 
 logger = logging.getLogger("salomao.hubspot_bot")
@@ -32,8 +34,13 @@ logger = logging.getLogger("salomao.hubspot_bot")
 class HubSpotSalomaoBot:
     MESSAGE_MAX_AGE_MINUTES = 5
     MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
+    MAX_DEBOUNCE_WAIT_SECONDS = 20
+    MAX_GENERATIONS_PER_CYCLE = 3
 
-    def __init__(self, store=None, agent=None):
+    def __init__(self, store=None, agent=None, memory=None, debounce_seconds=None):
+        self.debounce_seconds = HUBSPOT_MESSAGE_DEBOUNCE_SECONDS if debounce_seconds is None else max(0, debounce_seconds)
+        self.memory = memory if memory is not None else (
+            SupabaseConversationMemory() if store is None and SUPABASE_CONVERSATION_MEMORY_ENABLED else None)
         self.store = store if store is not None else DeliveryStore(DELIVERY_DB_PATH)
         self.agent = agent if agent is not None else salomao
         # Bounded striped locks: webhook + polling cannot process the same thread
@@ -42,7 +49,7 @@ class HubSpotSalomaoBot:
 
     @staticmethod
     def get_session_id_for_thread(thread_id):
-        return f"hubspot_thread_{thread_id}"
+        return f"whatsapp_salomao_thread_{thread_id}"
 
     @staticmethod
     def _eligible(ticket):
@@ -66,6 +73,12 @@ class HubSpotSalomaoBot:
 
     def get_unprocessed_visitor_messages(self, thread_id):
         messages = parse_incoming_messages(get_thread_messages(thread_id, strict=True))
+        if self.memory and not self.store.conversation_messages(thread_id):
+            restored = self.memory.load(thread_id)
+            if restored:
+                self.store.restore_memory(thread_id, restored)
+                logger.warning("Historico recuperado; entradas antigas sem recibo nao serao reenviadas", extra={
+                    "event": "memory.receipts_review", "thread_id": str(thread_id)})
         self.store.remember_messages(thread_id, messages)
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=self.MESSAGE_MAX_AGE_MINUTES)
         pending = []
@@ -87,6 +100,66 @@ class HubSpotSalomaoBot:
         logger.debug("Mensagens verificadas", extra={"event": "messages.scanned", "thread_id": str(thread_id),
             "message_count": len(messages), "pending_count": len(pending), "skipped_count": len(messages) - len(pending)})
         return sorted(pending, key=lambda msg: msg.get("created_at", ""))
+
+    def _save_memory(self, thread_id):
+        if self.memory:
+            self.memory.save(thread_id, self.store.conversation_messages(thread_id))
+
+    @staticmethod
+    def _merge_pending(previous, observed):
+        # A temporarily missing row/page must not erase a message already seen.
+        messages = {str(message["id"]): message for message in previous + observed}
+        return sorted(messages.values(), key=lambda message: (message.get("created_at", ""), str(message["id"])))
+
+    def _wait_for_quiet(self, thread_id, pending, deadline, batch_cutoff):
+        """Require five seconds since the last message, not since each webhook.
+
+        Runs in the existing worker thread, under the conversation lock. If the
+        customer keeps writing, close the batch after twenty seconds. Messages
+        beyond that fixed boundary belong to the next batch, including during
+        generation, so additions cannot postpone the same answer forever.
+        """
+        while pending:
+            timestamps = [message_time(message.get("created_at")) for message in pending]
+            if any(timestamp is None for timestamp in timestamps):
+                return None
+            timestamps = [timestamp for timestamp in timestamps if timestamp <= batch_cutoff]
+            if not timestamps:
+                return pending
+            quiet_for = (datetime.now(timezone.utc) - max(timestamps)).total_seconds()
+            remaining = min(self.debounce_seconds, max(0, self.debounce_seconds - quiet_for))
+            if remaining <= 0:
+                return pending
+            budget = deadline - time.monotonic()
+            if budget <= 0:
+                logger.info("Limite de espera atingido; lote fechado", extra={
+                    "event": "turn.debounce_limit", "thread_id": str(thread_id), "reason": "batch_wait_limit"})
+                return pending
+            logger.debug("Aguardando pausa nas mensagens", extra={"event": "turn.debounce",
+                "thread_id": str(thread_id), "pending_count": len(pending), "wait_seconds": round(remaining, 3)})
+            time.sleep(min(remaining, budget))
+            observed = self.get_unprocessed_visitor_messages(thread_id)
+            pending = self._merge_pending(pending, observed)
+        return pending
+
+    def _coalesce_pending(self, thread_id, pending):
+        """Several text bubbles before an answer form one customer turn."""
+        outgoing = [message_time(m.get("created_at")) for m in self.store.conversation_messages(thread_id)
+                    if not m.get("is_from_visitor")]
+        groups = []
+        for message in pending:
+            previous = groups[-1] if groups else None
+            start = message_time(previous.get("created_at")) if previous else None
+            end = message_time(message.get("created_at"))
+            if (previous and start and end and not previous.get("raw", {}).get("attachments")
+                    and not message.get("raw", {}).get("attachments")
+                    and not any(t and start < t < end for t in outgoing)
+                    and len(previous.get("text", "")) + len(message.get("text", "")) <= 8000):
+                groups[-1] = {**message, "text": previous.get("text", "") + "\n" + message.get("text", ""),
+                    "source_message_ids": previous.get("source_message_ids", [previous["id"]]) + [message["id"]]}
+            else:
+                groups.append(message)
+        return groups
 
     def _download_attachment_as_base64(self, url):
         parsed = urlsplit(url)
@@ -117,7 +190,8 @@ class HubSpotSalomaoBot:
             return {"success": True, "response": SCOPE_REDIRECT, "answer_status": "out_of_scope",
                     "transfer_requested": False, "scope_policy_version": SCOPE_POLICY_VERSION}
         attachments = message.get("raw", {}).get("attachments", [])
-        history = history_before(self.store.conversation_messages(thread_id), message)
+        current_ids = set(message.get("source_message_ids", [message.get("id")]))
+        history = history_before([m for m in self.store.conversation_messages(thread_id) if m["id"] not in current_ids], message)
         kwargs = {"conversation_history": history}
         selected, truncated = bounded_history(history)
         logger.info("Contexto da conversa preparado", extra={"event": "context.loaded", "thread_id": str(thread_id),
@@ -154,9 +228,9 @@ class HubSpotSalomaoBot:
             result = {"success": False}
         if not result.get("response"):
             result["response"] = "Não consegui consultar a orientação agora. Tente novamente em instantes ou peça para falar com um atendente."
-        if not message.get("text") and result.get("audio_transcription"):
+        if result.get("audio_transcription"):
             self.store.remember_messages(thread_id, [{**message, "is_from_visitor": True,
-                "text": result["audio_transcription"]}])
+                "text": "\n".join(filter(None, [message.get("text"), result["audio_transcription"]]))}])
         # A documented knowledge gap is actionable in the WhatsApp helpdesk.
         if result.get("answer_status") == "no_match":
             result["transfer_requested"] = True
@@ -172,6 +246,10 @@ class HubSpotSalomaoBot:
         return result
 
     def _deliver(self, entry, ticket_id):
+        # Never trust a caller's stale outbox snapshot.
+        entry = self.store.get(entry["thread_id"], entry["message_id"])
+        if entry["complete"]:
+            return {"message_id": entry["message_id"], "sent": False, "already_complete": True}
         thread_id, message_id, payload = entry["thread_id"], entry["message_id"], entry["payload"]
         if not approved_delivery(payload):
             # Retain the payload and confirmed-part receipts for audit. Do not
@@ -181,15 +259,27 @@ class HubSpotSalomaoBot:
                 "thread_id": thread_id, "message_id": message_id, "reason": "scope_approval_missing_or_changed"})
             return {"message_id": message_id, "sent": False, "answer_status": "scope_blocked"}
         for index in range(entry["sent_parts"], len(payload["parts"])):
-            sent = reply_to_visitor(thread_id, payload["parts"][index])
-            if not sent:
-                logger.error("Falha no envio; parte preservada para nova tentativa", extra={"event": "delivery.failed",
+            state = self.store.begin_part(thread_id, message_id, index)
+            if state == "confirmed":
+                continue
+            if state != "send":
+                logger.debug("Entrega retida aguardando conferencia", extra={"event": "delivery.held", "reason": state})
+                return {"message_id": message_id, "sent": False, "error": "delivery_uncertain", "needs_review": True}
+            try:
+                sent = reply_to_visitor(thread_id, payload["parts"][index])
+            except HubSpotSendRejected:
+                self.store.failed_part(thread_id, message_id, index, retryable=True)
+                logger.warning("Envio rejeitado; nova tentativa permitida", extra={"event": "delivery.rejected", "part": index + 1})
+                return {"message_id": message_id, "sent": False, "error": "delivery_rejected"}
+            except Exception:
+                sent = None
+            if not sent or not sent.get("id"):
+                self.store.failed_part(thread_id, message_id, index)
+                logger.error("Envio sem confirmacao; reenvio automatico bloqueado", extra={"event": "delivery.uncertain",
                     "thread_id": thread_id, "message_id": message_id, "part": index + 1})
-                return {"message_id": message_id, "sent": False, "error": "Falha ao enviar via HubSpot"}
-            self.store.confirm_part(thread_id, message_id, index + 1)
-            self.store.remember_messages(thread_id, [{"id": sent.get("id") or f"sent_{message_id}_{index}",
-                "created_at": sent.get("createdAt") or datetime.now(timezone.utc).isoformat(),
-                "text": payload["parts"][index], "is_from_visitor": False}])
+                return {"message_id": message_id, "sent": False, "error": "delivery_uncertain", "needs_review": True}
+            self.store.confirm_delivery_part(thread_id, message_id, index, sent, payload["parts"][index])
+            self._save_memory(thread_id)
             logger.info("Parte da resposta enviada", extra={"event": "delivery.part_sent", "thread_id": thread_id,
                 "message_id": message_id, "part": index + 1, "parts": len(payload["parts"])})
         if payload.get("transfer_requested"):
@@ -206,6 +296,13 @@ class HubSpotSalomaoBot:
                 "answer_status": payload.get("answer_status", "answered")}
 
     def process_thread(self, thread_id, ticket_id=None):
+        with self.store.thread_lock(thread_id) as acquired:
+            if not acquired:
+                logger.debug("Outro processo esta atendendo a conversa", extra={"event": "turn.skipped", "reason": "process_locked"})
+                return []
+            return self._process_thread_locked(thread_id, ticket_id)
+
+    def _process_thread_locked(self, thread_id, ticket_id=None):
         lock = self._locks[hash(thread_id) % len(self._locks)]
         if not lock.acquire(blocking=False):
             logger.debug("Conversa ja esta em processamento", extra={"event": "turn.skipped", "thread_id": str(thread_id), "reason": "thread_locked"})
@@ -230,9 +327,26 @@ class HubSpotSalomaoBot:
             except HubSpotReadError:
                 logger.warning("Processamento adiado: historico indisponivel", extra={"event": "turn.deferred", "reason": "history_unavailable"})
                 return responses + [{"error": "history_unavailable", "sent": False}]
-            for message in pending:
-                if self.store.get(thread_id, message["id"]):
-                    continue
+            generations = 0
+            while pending and generations < self.MAX_GENERATIONS_PER_CYCLE:
+                pending = [m for m in pending if not self.store.get(thread_id, m["id"])]
+                if not pending:
+                    break
+                batch_start = message_time(pending[0].get("created_at"))
+                if batch_start is None:
+                    break
+                batch_cutoff = batch_start + timedelta(seconds=self.MAX_DEBOUNCE_WAIT_SECONDS)
+                deadline = time.monotonic() + min(self.MAX_DEBOUNCE_WAIT_SECONDS,
+                    max(0, (batch_cutoff - datetime.now(timezone.utc)).total_seconds()))
+                try:
+                    pending = self._wait_for_quiet(thread_id, pending, deadline, batch_cutoff)
+                except HubSpotReadError:
+                    return responses + [{"error": "history_unavailable", "sent": False}]
+                if not pending:
+                    break
+                batch = [m for m in pending if message_time(m.get("created_at")) <= batch_cutoff]
+                message = self._coalesce_pending(thread_id, batch)[0]
+                observed_ids = {str(m["id"]) for m in pending}
                 # Ownership may change while a previous response was generated.
                 if not self._eligible(get_ticket_by_id(ticket_id)):
                     break
@@ -241,14 +355,31 @@ class HubSpotSalomaoBot:
                                  session_id=self.get_session_id_for_thread(thread_id), run_id=run_id):
                     started = time.perf_counter()
                     logger.info("Processando mensagem", extra={"event": "turn.started"})
+                    self._save_memory(thread_id)
                     result = self.process_message(thread_id, message)
+                    generations += 1
                     logger.info("Resposta preparada", extra={"event": "turn.generated", "model": result.get("model_used"),
                         "answer_status": result.get("answer_status"), "handoff": bool(result.get("transfer_requested")),
                         "duration_ms": round((time.perf_counter() - started) * 1000)})
+                    # No outbox row/receipt has been created yet: this draft can
+                    # safely be discarded when a complement arrives mid-generation.
+                    try:
+                        observed = self.get_unprocessed_visitor_messages(thread_id)
+                    except HubSpotReadError:
+                        logger.warning("Envio adiado: nao foi possivel conferir novas mensagens", extra={
+                            "event": "turn.deferred", "reason": "pre_send_history_unavailable"})
+                        return responses + [{"error": "history_unavailable", "sent": False}]
+                    pending = self._merge_pending(pending, observed)
+                    if {str(m["id"]) for m in observed
+                            if message_time(m.get("created_at")) <= batch_cutoff} - observed_ids:
+                        logger.info("Complemento recebido; resposta sera atualizada", extra={
+                            "event": "turn.draft_superseded", "pending_count": len(pending)})
+                        continue
                     parts = split_whatsapp(result["response"], WHATSAPP_MAX_MESSAGE_LENGTH)
                     entry = self.store.enqueue(thread_id, message["id"], {
                         "response": result["response"], "parts": parts, "run_id": run_id,
                         "user_message": message.get("text", ""),
+                        "source_message_ids": message.get("source_message_ids", [message["id"]]),
                         "transfer_requested": bool(result.get("transfer_requested")),
                         "answer_status": result.get("answer_status", "answered"),
                         "scope_policy_version": result.get("scope_policy_version"),
@@ -261,6 +392,8 @@ class HubSpotSalomaoBot:
                     responses.append(delivered)
                     if delivered.get("error") or delivered.get("transferred"):
                         break
+            if generations >= self.MAX_GENERATIONS_PER_CYCLE and any(not self.store.get(thread_id, m["id"]) for m in pending):
+                logger.info("Mais mensagens aguardam o proximo ciclo", extra={"event": "turn.deferred", "reason": "generation_cycle_limit"})
             return responses
         finally:
             lock.release()
@@ -285,6 +418,12 @@ class HubSpotSalomaoBot:
         if not thread or not thread.get("id"):
             return {"success": False, "error": "Thread não encontrado"}
         thread_id = str(thread["id"])
+        with self.store.thread_lock(thread_id) as acquired:
+            if not acquired:
+                return {"success": False, "error": "Conversa em processamento"}
+            return self._send_manual_locked(ticket_id, thread_id, question)
+
+    def _send_manual_locked(self, ticket_id, thread_id, question):
         lock = self._locks[hash(thread_id) % len(self._locks)]
         with lock:
             if self.store.pending(thread_id):
