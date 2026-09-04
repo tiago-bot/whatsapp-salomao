@@ -83,6 +83,29 @@ Eventos: `delivery.rejected` (repetição permitida), `delivery.uncertain` (conf
 `delivery.held` (continua retida, DEBUG), `delivery.part_sent` e `delivery.completed`.
 Uma pendência incerta suspende novos envios nessa conversa, preservando a ordem.
 
+## Observação na transferência para o Suporte N1
+
+Antes de mover o ticket para Suporte N1 / Novo, o backend cria uma nota associada
+ao ticket (`POST /crm/v3/objects/notes`, associação Note → Ticket `228`). Ela fica
+visível na área de Observações e contém somente informações já observadas:
+
+- problema e contexto relatados pelo cliente;
+- orientações já enviadas pelo Salomão;
+- resultado explicitamente informado, ou a ausência dessa confirmação;
+- motivo da transferência;
+- fontes registradas na conversa;
+- referência interna determinística para auditoria.
+
+O HTML é escapado antes do envio e a nota tem limite próprio, sem registrar o
+conteúdo nos logs. A criação da nota também possui claim e recibo persistentes.
+Uma rejeição explícita permite repetição. Timeout, 5xx ou resposta sem ID retêm a
+transferência para conferência e não repetem o POST automaticamente. Depois que a
+nota é confirmada, falhas ao mover o ticket repetem apenas a mudança de pipeline,
+sem reenviar mensagens e sem criar uma segunda observação.
+
+Referências: [Notes API](https://developers.hubspot.com/docs/api-reference/legacy/crm/activities/notes/guide)
+e [tipos padrão de associação](https://developers.hubspot.com/docs/api-reference/latest/crm/associations/associate-records/guide).
+
 Inspeção sem modificar dados, no ambiente com o volume montado:
 
 ```sh

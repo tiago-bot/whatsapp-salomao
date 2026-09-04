@@ -22,7 +22,8 @@ _fields = {"event", "ticket_id", "thread_id", "message_id", "session_id", "run_i
            "pending_count", "skipped_count", "source_count", "source_ids", "route",
            "answer_status", "parts", "part", "handoff", "interval_seconds",
            "ticket_count", "response_count", "error_count", "pipeline_id", "stage_id",
-           "owner_id", "polling_enabled", "contextualized", "page_count", "scope_policy_version", "wait_seconds"}
+           "owner_id", "polling_enabled", "contextualized", "page_count", "scope_policy_version", "wait_seconds",
+           "note_id"}
 
 
 def clean_log_text(value):

@@ -721,7 +721,7 @@ class SalomaoSupervisorAgent:
         start = time.perf_counter()
         if requests_human(message):
             return SalomaoPipelineResponse(
-                message="Vou encaminhar seu atendimento para a equipe da inChurch.",
+                message="Vou encaminhar seu atendimento para a equipe de Suporte N1 da inChurch.",
                 requires_human_handoff=True, handoff_reason="Pedido explícito do cliente",
                 route=Rota.ESCALAR_IMEDIATAMENTE.value, model_name="human_handoff",
                 agent_trace=["explicit_human_request"],
@@ -1609,7 +1609,7 @@ class SalomaoAgent:
             if result.answer_status == "no_match":
                 result.requires_human_handoff = True
             if result.requires_human_handoff:
-                result.message = "Vou encaminhar seu atendimento para a equipe da inChurch."
+                result.message = "Vou encaminhar seu atendimento para a equipe de Suporte N1 da inChurch."
             result.message = format_whatsapp(result.message)
 
         self._safe_db_call(
@@ -1672,6 +1672,7 @@ class SalomaoAgent:
             "suggested_actions": result.suggested_actions,
             "session_id": session_id,
             "transfer_requested": result.requires_human_handoff,
+            "handoff_reason": result.handoff_reason,
             "audio_transcription": audio_transcription,
             "model_used": result.model_name or DEFAULT_MODEL,
             "message_count": message_count + 1,

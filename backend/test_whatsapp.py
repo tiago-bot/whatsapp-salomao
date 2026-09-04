@@ -15,6 +15,7 @@ for key, value in {"OPENAI_API_KEY": "test-key", "PINECONE_API_KEY": "test-key",
 from whatsapp_formatting import format_whatsapp, split_whatsapp, message_length, whatsapp_rich_text
 from delivery_store import DeliveryStore
 from handoff import requests_human
+from handoff_note import build_handoff_note
 import hubspot_bot as bot_module
 import salomao_agent as agent_module
 
@@ -84,11 +85,16 @@ class FormattingTests(unittest.TestCase):
 
 class HandoffTests(unittest.TestCase):
     def test_explicit_requests(self):
-        for text in ["Quero falar com um atendente", "humano", "Me transfira para uma pessoa", "preciso de suporte", "falar com alguém"]:
+        for text in ["Quero falar com um atendente", "humano", "Me transfira para uma pessoa", "preciso de suporte",
+                     "falar com alguém", "suporte", "Queria falar com o suporte N1", "Tem como falar com uma pessoa?",
+                     "Me passa pro suporte", "Pode me encaminhar para o atendimento humano?",
+                     "Não quero falar com robô, quero um atendente"]:
             self.assertTrue(requests_human(text), text)
 
     def test_incidental_words_are_not_handoffs(self):
-        for text in ["Como cadastrar uma pessoa?", "gestão de pessoas", "A plataforma tem suporte a PIX?", "Não quero falar com atendente", "pessoa", "Como dar suporte aos membros?"]:
+        for text in ["Como cadastrar uma pessoa?", "gestão de pessoas", "A plataforma tem suporte a PIX?",
+                     "Não quero falar com atendente", "Não preciso de suporte", "Não me transfira para o suporte",
+                     "Não precisa me transferir para o suporte", "pessoa", "Como dar suporte aos membros?"]:
             self.assertFalse(requests_human(text), text)
 
     def test_explicit_handoff_needs_no_model(self):
@@ -101,6 +107,24 @@ class HandoffTests(unittest.TestCase):
         supervisor = object.__new__(agent_module.SalomaoSupervisorAgent)
         content = supervisor._extract_content(SimpleNamespace(content="<REQUIRES_ESCALATION>"))
         self.assertTrue(supervisor._check_handoff(content, agent_module.heuristic_triage("evento"))[0])
+
+    def test_handoff_note_contains_context_guidance_result_reason_and_sources(self):
+        messages = [
+            {"is_from_visitor": True, "text": "O cadastro de membro continua apresentando o mesmo erro."},
+            {"is_from_visitor": False, "text": "Abra Pessoas > Membros. Fonte: https://portal.inchurch.com.br/membros"},
+            {"is_from_visitor": True, "text": "Não funcionou. Quero falar com o suporte."},
+        ]
+        note = build_handoff_note(thread_id="t", message_id="m", messages=messages,
+            reason="Pedido explícito do cliente.", sources=[])
+        for heading in ["Problema e contexto", "Orientações já fornecidas", "Resultado até o momento",
+                        "Motivo da transferência", "Fontes consultadas"]:
+            self.assertIn(heading, note)
+        self.assertIn("Não funcionou", note)
+        self.assertEqual(note.count("Não funcionou"), 2)
+        self.assertIn("portal.inchurch.com.br/membros", note)
+        self.assertIn("SALOMAO-", note)
+        self.assertNotIn("<script>", build_handoff_note(thread_id="t", message_id="x",
+            messages=[{"is_from_visitor": True, "text": "<script>alert(1)</script>"}], reason="teste"))
 
 
 class DeliveryTests(unittest.TestCase):
@@ -118,6 +142,7 @@ class DeliveryTests(unittest.TestCase):
                         "hubspot_owner_id": bot_module.SALOMAO_ACTOR_ID.removeprefix("A-")}}
         self.ticket_mock = patch.object(bot_module, "get_ticket_by_id", return_value=self.ticket).start()
         patch.object(bot_module, "get_thread_messages", return_value=[]).start()
+        self.note_mock = patch.object(bot_module, "create_ticket_handoff_note", return_value={"id": "note1"}).start()
         patch("requests.sessions.Session.request", side_effect=AssertionError("Network is forbidden in offline tests")).start()
         self.addCleanup(patch.stopall)
 
@@ -150,6 +175,33 @@ class DeliveryTests(unittest.TestCase):
             self.assertTrue(result["transferred"])
             self.assertEqual(send.call_count, 2)
             self.assertEqual(transfer.call_count, 2)
+            self.note_mock.assert_called_once()
+
+    def test_uncertain_note_is_never_duplicated_and_ticket_is_not_moved(self):
+        entry = self.enqueue(transfer=True)
+        self.note_mock.side_effect = TimeoutError
+        with patch.object(bot_module, "reply_to_visitor", return_value={"id": "sent"}) as send, \
+             patch.object(bot_module, "transfer_ticket_to_human_support") as transfer:
+            first = self.bot._deliver(entry, "ticket")
+            second = self.bot._deliver(self.store.get("t1", "m1"), "ticket")
+        self.assertTrue(first["needs_review"])
+        self.assertTrue(second["needs_review"])
+        self.note_mock.assert_called_once()
+        transfer.assert_not_called()
+        self.assertEqual(send.call_count, 2)
+
+    def test_explicit_note_rejection_retries_note_without_resending_reply(self):
+        entry = self.enqueue(transfer=True)
+        self.note_mock.side_effect = [bot_module.HubSpotNoteRejected(), {"id": "note2"}]
+        with patch.object(bot_module, "reply_to_visitor", return_value={"id": "sent"}) as send, \
+             patch.object(bot_module, "transfer_ticket_to_human_support", return_value=True) as transfer:
+            first = self.bot._deliver(entry, "ticket")
+            second = self.bot._deliver(self.store.get("t1", "m1"), "ticket")
+        self.assertEqual(first["error"], "handoff_note_rejected")
+        self.assertTrue(second["transferred"])
+        self.assertEqual(send.call_count, 2)
+        self.assertEqual(self.note_mock.call_count, 2)
+        transfer.assert_called_once_with("ticket")
 
     def test_generation_is_cached_until_delivery(self):
         with patch.object(self.bot, "get_unprocessed_visitor_messages", return_value=[self.message()]), patch.object(bot_module, "reply_to_visitor", return_value=None):
@@ -183,6 +235,14 @@ class DeliveryTests(unittest.TestCase):
         result = self.bot.process_message("t1", self.message())
         self.assertIn("Não consegui", result["response"])
         self.assertFalse(result["success"])
+
+    def test_human_request_has_priority_over_external_scope_and_skips_model(self):
+        message = self.message(text="Quero falar com o suporte sobre futebol")
+        result = self.bot.process_message("t1", message)
+        self.assertTrue(result["transfer_requested"])
+        self.assertEqual(result["answer_status"], "human_handoff")
+        self.assertIn("Suporte N1", result["response"])
+        self.agent.process_message.assert_not_called()
 
     def test_attachment_mime_is_used_without_extension(self):
         with patch.object(self.bot, "_download_attachment_as_base64", return_value="YWJj"):

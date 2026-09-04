@@ -7,7 +7,7 @@ import os
 import logging
 import requests
 from typing import Optional, List, Dict, Any
-from datetime import datetime
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 from config import WHATSAPP_MAX_MESSAGE_LENGTH
 from whatsapp_formatting import format_whatsapp, message_length, whatsapp_rich_text
@@ -26,7 +26,7 @@ SALOMAO_ENTRY_PROPERTY = os.getenv(
     "HUBSPOT_SALOMAO_ENTRY_PROPERTY", f"hs_v2_date_entered_{SALOMAO_STATUS}"
 )
 
-# Pipeline e Status para transferir para humano
+# Destino humano: pipeline Suporte N1 e status Novo
 HUMAN_PIPELINE = os.getenv("HUBSPOT_HUMAN_PIPELINE", "636459134")
 HUMAN_STATUS = os.getenv("HUBSPOT_HUMAN_STATUS", "939275049")
 
@@ -46,6 +46,10 @@ class HubSpotReadError(RuntimeError):
 
 class HubSpotSendRejected(RuntimeError):
     """No message was accepted; a later attempt is safe."""
+
+
+class HubSpotNoteRejected(RuntimeError):
+    """No note was accepted; a later attempt is safe."""
 
 
 def get_headers() -> dict:
@@ -115,11 +119,50 @@ def get_tickets_in_pipeline(pipeline_id: str = TARGET_PIPELINE, stage_id: str = 
 
 HUMAN_SUPPORT_PIPELINE = HUMAN_PIPELINE
 HUMAN_SUPPORT_STAGE = HUMAN_STATUS
+NOTE_TO_TICKET_ASSOCIATION_TYPE_ID = 228
+
+
+def create_ticket_handoff_note(ticket_id: str, body: str) -> Optional[dict]:
+    """Create an internal note associated with a ticket.
+
+    Explicit client errors are safe to retry. Timeouts, 5xx responses and a
+    success response without an ID are ambiguous and return None so the caller
+    can hold the transfer instead of risking a duplicate observation.
+    """
+    payload = {
+        "properties": {
+            "hs_timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+            "hs_note_body": str(body)[:65536],
+        },
+        "associations": [{
+            "to": {"id": str(ticket_id)},
+            "types": [{
+                "associationCategory": "HUBSPOT_DEFINED",
+                "associationTypeId": NOTE_TO_TICKET_ASSOCIATION_TYPE_ID,
+            }],
+        }],
+    }
+    try:
+        response = requests.post(
+            f"{HUBSPOT_API_BASE}/crm/v3/objects/notes",
+            headers=get_headers(), json=payload, timeout=30, allow_redirects=False,
+        )
+    except requests.RequestException:
+        return None
+    if response.status_code in {400, 401, 403, 404, 409, 422, 429}:
+        raise HubSpotNoteRejected(f"note_rejected_{response.status_code}")
+    if response.status_code not in {200, 201}:
+        return None
+    try:
+        result = response.json()
+    except ValueError:
+        return None
+    return result if result.get("id") else None
 
 
 def transfer_ticket_to_human_support(ticket_id: str) -> bool:
     """
-    Transfere um ticket para a pipeline de atendimento humano.
+    Transfere um ticket para a pipeline Suporte N1, no status Novo.
     - Limpa o proprietário (para liberar para equipe humana)
     - Move para pipeline e status de atendimento humano
 
@@ -139,7 +182,7 @@ def transfer_ticket_to_human_support(ticket_id: str) -> bool:
             }
         }
 
-        logger.info(f"Transferindo ticket {ticket_id} para atendimento humano...")
+        logger.info(f"Transferindo ticket {ticket_id} para Suporte N1 / Novo")
         logger.info(f"Pipeline: {HUMAN_SUPPORT_PIPELINE}")
         logger.info(f"Stage: {HUMAN_SUPPORT_STAGE}")
         logger.info(f"Owner: (limpo)")
@@ -147,7 +190,7 @@ def transfer_ticket_to_human_support(ticket_id: str) -> bool:
         response = requests.patch(url, headers=get_headers(), json=payload, timeout=30)
 
         if response.status_code == 200:
-            logger.info(f"Ticket {ticket_id} transferido para atendimento humano com sucesso!")
+            logger.info(f"Ticket {ticket_id} transferido para Suporte N1 / Novo")
             return True
         else:
             logger.error(f"Erro ao transferir ticket: {response.status_code}")

@@ -91,6 +91,32 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(payload["text"], "*Título*\n\n*Eventos* <img src=x>")
         self.assertNotIn("<img", payload["richText"])
 
+    def test_human_handoff_targets_support_n1_new_stage(self):
+        self.assertEqual(hubspot_service.HUMAN_PIPELINE, "636459134")
+        self.assertEqual(hubspot_service.HUMAN_STATUS, "939275049")
+        with patch.object(hubspot_service.requests, "patch") as request:
+            request.return_value.status_code = 200
+            self.assertTrue(hubspot_service.transfer_ticket_to_human_support("ticket"))
+        self.assertEqual(request.call_args.kwargs["json"]["properties"], {
+            "hs_pipeline": "636459134",
+            "hs_pipeline_stage": "939275049",
+            "hubspot_owner_id": "",
+        })
+
+    def test_handoff_note_is_created_in_ticket_observations(self):
+        with patch.object(hubspot_service.requests, "post") as request:
+            request.return_value.status_code = 201
+            request.return_value.json.return_value = {"id": "note"}
+            note = hubspot_service.create_ticket_handoff_note("ticket", "<strong>Resumo</strong>")
+        self.assertEqual(note["id"], "note")
+        payload = request.call_args.kwargs["json"]
+        self.assertEqual(payload["properties"]["hs_note_body"], "<strong>Resumo</strong>")
+        self.assertIn("hs_timestamp", payload["properties"])
+        self.assertEqual(payload["associations"], [{
+            "to": {"id": "ticket"},
+            "types": [{"associationCategory": "HUBSPOT_DEFINED", "associationTypeId": 228}],
+        }])
+
     def test_invalid_audio_never_reaches_knowledge_search(self):
         agent = object.__new__(salomao_agent.SalomaoAgent)
         with patch.object(salomao_agent, "SalomaoSupervisorAgent") as supervisor:

@@ -16,6 +16,8 @@ from conversation_memory import SupabaseConversationMemory
 from delivery_store import DeliveryStore
 from conversation_context import bounded_history, history_before, message_time
 from logging_config import log_context
+from handoff import requests_human
+from handoff_note import build_handoff_note
 from salomao_agent import salomao
 from whatsapp_formatting import format_whatsapp, split_whatsapp
 from scope_policy import (SCOPE_POLICY_VERSION, SCOPE_UNAVAILABLE, SCOPE_REDIRECT,
@@ -25,7 +27,7 @@ from hubspot_service import (
     get_thread_messages, parse_incoming_messages, reply_to_visitor,
     transfer_ticket_to_human_support, SALOMAO_PIPELINE, SALOMAO_STATUS,
     SALOMAO_ACTOR_ID, get_headers,
-    HubSpotReadError, HubSpotSendRejected,
+    create_ticket_handoff_note, HubSpotReadError, HubSpotSendRejected, HubSpotNoteRejected,
 )
 
 logger = logging.getLogger("salomao.hubspot_bot")
@@ -185,7 +187,17 @@ class HubSpotSalomaoBot:
         return base64.b64encode(data).decode("ascii")
 
     def process_message(self, thread_id, message):
-        if explicit_external_request(message.get("text", "")):
+        message_text = message.get("text", "")
+        # Human support is a routing command, even when the same message also
+        # mentions a subject outside the assistant's knowledge scope.
+        if requests_human(message_text):
+            logger.info("Pedido de suporte humano identificado", extra={
+                "event": "handoff.requested", "thread_id": str(thread_id), "message_id": message.get("id")})
+            return {"success": True, "response": "Vou encaminhar seu atendimento para a equipe de Suporte N1 da inChurch.",
+                    "answer_status": "human_handoff", "transfer_requested": True,
+                    "handoff_reason": "Pedido explícito do cliente para falar com o suporte.",
+                    "scope_policy_version": SCOPE_POLICY_VERSION, "model_used": "deterministic_handoff"}
+        if explicit_external_request(message_text):
             logger.info("Pergunta externa bloqueada antes do agente", extra={"event": "scope.input_blocked", "reason": "deterministic_rule"})
             return {"success": True, "response": SCOPE_REDIRECT, "answer_status": "out_of_scope",
                     "transfer_requested": False, "scope_policy_version": SCOPE_POLICY_VERSION}
@@ -216,7 +228,7 @@ class HubSpotSalomaoBot:
                 else:
                     raise ValueError("unsupported_attachment")
             result = self.agent.process_message(
-                message=message.get("text", ""),
+                message=message_text,
                 session_id=self.get_session_id_for_thread(thread_id),
                 originating_channel="whatsapp", **kwargs,
             )
@@ -234,8 +246,10 @@ class HubSpotSalomaoBot:
         # A documented knowledge gap is actionable in the WhatsApp helpdesk.
         if result.get("answer_status") == "no_match":
             result["transfer_requested"] = True
+            if not result.get("handoff_reason"):
+                result["handoff_reason"] = "A base oficial não contém orientação suficiente para concluir o atendimento."
         if result.get("transfer_requested"):
-            result["response"] = "Vou encaminhar seu atendimento para a equipe da inChurch."
+            result["response"] = "Vou encaminhar seu atendimento para a equipe de Suporte N1 da inChurch."
         result["response"] = format_whatsapp(result["response"])
         if (obvious_external_answer(result["response"]) or
                 (result.get("scope_policy_version") != SCOPE_POLICY_VERSION and
@@ -283,6 +297,43 @@ class HubSpotSalomaoBot:
             logger.info("Parte da resposta enviada", extra={"event": "delivery.part_sent", "thread_id": thread_id,
                 "message_id": message_id, "part": index + 1, "parts": len(payload["parts"])})
         if payload.get("transfer_requested"):
+            note_body = payload.get("handoff_note_body")
+            if not note_body:
+                note_body = build_handoff_note(
+                    thread_id=thread_id, message_id=message_id,
+                    messages=self.store.conversation_messages(thread_id),
+                    reason=payload.get("handoff_reason"), sources=payload.get("sources"),
+                )
+                entry = self.store.update_payload(thread_id, message_id, {"handoff_note_body": note_body})
+                payload = entry["payload"]
+            note_state = self.store.begin_handoff_note(thread_id, message_id)
+            if note_state == "send":
+                try:
+                    note = create_ticket_handoff_note(ticket_id, note_body)
+                except HubSpotNoteRejected:
+                    self.store.failed_handoff_note(thread_id, message_id, retryable=True)
+                    logger.warning("Observacao rejeitada; nova tentativa permitida", extra={
+                        "event": "handoff.note_rejected", "thread_id": thread_id, "message_id": message_id})
+                    return {"message_id": message_id, "sent": True, "transferred": False,
+                            "error": "handoff_note_rejected"}
+                except Exception:
+                    note = None
+                if not note or not note.get("id"):
+                    self.store.failed_handoff_note(thread_id, message_id)
+                    logger.error("Observacao sem confirmacao; transferencia retida", extra={
+                        "event": "handoff.note_uncertain", "thread_id": thread_id, "message_id": message_id})
+                    return {"message_id": message_id, "sent": True, "transferred": False,
+                            "error": "handoff_note_uncertain", "needs_review": True}
+                self.store.confirm_handoff_note(thread_id, message_id, note)
+                logger.info("Observacao de transferencia criada", extra={
+                    "event": "handoff.note_created", "thread_id": thread_id, "message_id": message_id,
+                    "note_id": str(note["id"])})
+            elif note_state != "confirmed":
+                logger.warning("Transferencia retida: observacao exige conferencia", extra={
+                    "event": "handoff.note_held", "thread_id": thread_id, "message_id": message_id,
+                    "reason": note_state})
+                return {"message_id": message_id, "sent": True, "transferred": False,
+                        "error": "handoff_note_uncertain", "needs_review": True}
             if not ticket_id or not transfer_ticket_to_human_support(ticket_id):
                 # Parts remain confirmed; next poll retries only the handoff.
                 return {"message_id": message_id, "sent": True, "transferred": False,
@@ -381,10 +432,19 @@ class HubSpotSalomaoBot:
                         "user_message": message.get("text", ""),
                         "source_message_ids": message.get("source_message_ids", [message["id"]]),
                         "transfer_requested": bool(result.get("transfer_requested")),
+                        "handoff_reason": result.get("handoff_reason"),
+                        "sources": result.get("sources", []),
                         "answer_status": result.get("answer_status", "answered"),
                         "scope_policy_version": result.get("scope_policy_version"),
                         "scope_digest": approval_digest(result["response"], parts),
                     })
+                    if result.get("transfer_requested"):
+                        note_body = build_handoff_note(
+                            thread_id=thread_id, message_id=message["id"],
+                            messages=self.store.conversation_messages(thread_id),
+                            reason=result.get("handoff_reason"), sources=result.get("sources", []),
+                        )
+                        entry = self.store.update_payload(thread_id, message["id"], {"handoff_note_body": note_body})
                     if not self._eligible(get_ticket_by_id(ticket_id)):
                         logger.info("Envio suspenso: ticket fora dos filtros", extra={"event": "delivery.deferred", "reason": "eligibility_changed"})
                         break

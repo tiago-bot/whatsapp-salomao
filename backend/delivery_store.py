@@ -22,7 +22,14 @@ class DeliveryStore:
                 thread_id TEXT NOT NULL, message_id TEXT NOT NULL,
                 payload TEXT NOT NULL, sent_parts INTEGER NOT NULL DEFAULT 0,
                 complete INTEGER NOT NULL DEFAULT 0,
+                handoff_note_state TEXT NOT NULL DEFAULT 'pending',
+                handoff_note_id TEXT,
                 PRIMARY KEY (thread_id, message_id))""")
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(deliveries)")}
+            if "handoff_note_state" not in columns:
+                conn.execute("ALTER TABLE deliveries ADD COLUMN handoff_note_state TEXT NOT NULL DEFAULT 'pending'")
+            if "handoff_note_id" not in columns:
+                conn.execute("ALTER TABLE deliveries ADD COLUMN handoff_note_id TEXT")
             conn.execute("""CREATE TABLE IF NOT EXISTS conversation_messages (
                 thread_id TEXT NOT NULL, message_id TEXT NOT NULL, created_at TEXT NOT NULL,
                 role TEXT NOT NULL, content TEXT NOT NULL,
@@ -75,6 +82,49 @@ class DeliveryStore:
         with self._connect() as conn:
             conn.execute("UPDATE delivery_attempts SET state=? WHERE thread_id=? AND message_id=? AND part=? AND state='sending'",
                 ("retryable" if retryable else "uncertain", thread_id, message_id, part))
+
+    def begin_handoff_note(self, thread_id, message_id):
+        """Durably claim the non-idempotent note POST before calling HubSpot."""
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("""SELECT complete,handoff_note_state,handoff_note_id FROM deliveries
+                WHERE thread_id=? AND message_id=?""", (thread_id, message_id)).fetchone()
+            if not row:
+                return "missing"
+            if row["handoff_note_state"] == "confirmed":
+                return "confirmed"
+            if row["handoff_note_state"] not in {"pending", "retryable"}:
+                return "uncertain"
+            conn.execute("""UPDATE deliveries SET handoff_note_state='sending'
+                WHERE thread_id=? AND message_id=?""", (thread_id, message_id))
+        return "send"
+
+    def failed_handoff_note(self, thread_id, message_id, *, retryable=False):
+        with self._connect() as conn:
+            conn.execute("""UPDATE deliveries SET handoff_note_state=?
+                WHERE thread_id=? AND message_id=? AND handoff_note_state='sending'""",
+                ("retryable" if retryable else "uncertain", thread_id, message_id))
+
+    def confirm_handoff_note(self, thread_id, message_id, note):
+        remote_id = (note or {}).get("id")
+        if not remote_id:
+            raise ValueError("missing_handoff_note_receipt")
+        with self._connect() as conn:
+            conn.execute("""UPDATE deliveries SET handoff_note_state='confirmed',handoff_note_id=?
+                WHERE thread_id=? AND message_id=? AND handoff_note_state='sending'""",
+                (str(remote_id), thread_id, message_id))
+
+    def update_payload(self, thread_id, message_id, fields):
+        """Persist generated handoff metadata before its first external write."""
+        with self._connect() as conn:
+            row = conn.execute("SELECT payload FROM deliveries WHERE thread_id=? AND message_id=?",
+                               (thread_id, message_id)).fetchone()
+            if not row:
+                return None
+            payload = {**json.loads(row["payload"]), **fields}
+            conn.execute("UPDATE deliveries SET payload=? WHERE thread_id=? AND message_id=?",
+                (json.dumps(payload, ensure_ascii=False), thread_id, message_id))
+        return self.get(thread_id, message_id)
 
     def confirm_delivery_part(self, thread_id, message_id, part, sent, text):
         """Receipt, progress and delivered context share one durable transaction."""
