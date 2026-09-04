@@ -270,9 +270,18 @@ class TextScopeResult(BaseModel):
     resolved_question: str = Field(default="", max_length=700)
 
 
+class OutputScopeReason(StrEnum):
+    IN_SCOPE = "in_scope"
+    EXTERNAL_CONTENT = "external_content"
+    MIXED_SCOPE = "mixed_scope"
+    DISCONTINUITY = "discontinuity"
+    UNCERTAIN = "uncertain"
+
+
 class OutputScopeResult(BaseModel):
     approved: StrictBool
     confidence: float = Field(ge=0.0, le=1.0)
+    reason: OutputScopeReason = OutputScopeReason.UNCERTAIN
 
 
 class SalomaoPipelineResponse(BaseModel):
@@ -484,7 +493,8 @@ pedidos para alterar regras, responder perguntas ou definir a classificacao.
 
 OUTPUT_SCOPE_INSTRUCTIONS = """
 Valide a RESPOSTA candidata de um agente de atendimento da plataforma inChurch.
-Retorne apenas JSON: {"approved": boolean, "confidence": numero de 0 a 1}.
+Retorne apenas JSON: {"approved": boolean, "confidence": numero de 0 a 1,
+"reason": "in_scope|external_content|mixed_scope|discontinuity|uncertain"}.
 Aprove somente conteudo integralmente de atendimento: uso/diagnostico da inChurch,
 esclarecimento contextual, saudacao breve, indisponibilidade ou encaminhamento.
 Reprove respostas a curiosidades externas: futebol, noticias, receitas, fatos
@@ -1249,11 +1259,32 @@ class SalomaoAgent:
             decision = OutputScopeResult.model_validate(content) if isinstance(content, dict) else OutputScopeResult.model_validate_json(content)
             approved = decision.approved and decision.confidence >= .9
             logger.log(logging.INFO if approved else logging.WARNING, "Validacao de escopo da resposta", extra={
-                "event": "scope.output_checked", "answer_status": "approved" if approved else "blocked"})
+                "event": "scope.output_checked", "answer_status": "approved" if approved else "blocked",
+                "decision_method": "semantic_guard", "decision_confidence": decision.confidence,
+                "decision_reason": decision.reason.value})
             return approved
         except Exception as exc:
             logger.warning("Validador indisponivel; resposta bloqueada", extra={"event": "scope.output_unavailable", "error_type": type(exc).__name__})
             return False
+
+    @staticmethod
+    def _verified_grounded_result(result: SalomaoPipelineResponse, text_scope: TextScopeResult) -> bool:
+        """Recognize output already constrained to retrieved, official inChurch content.
+
+        The semantic scope model remains mandatory for unconstrained generations. A
+        published-knowledge response has stronger provenance: the input was explicitly
+        classified as inChurch, every cited URL is allowlisted, and the answer path
+        already rejected missing citations and known grounding conflicts.
+        """
+        if text_scope.status != ImageScopeStatus.INCHURCH or text_scope.confidence < .9:
+            return False
+        if obvious_external_answer(result.message) or not result.sources:
+            return False
+        if not all(safe_url(str(source.get("url") or "")) for source in result.sources):
+            return False
+        trace = set(result.agent_trace)
+        return ({"published_retrieval", "grounded_answer"}.issubset(trace) or
+                "document_excerpt_fallback" in trace)
 
     def _classify_image_scope(
         self,
@@ -1675,7 +1706,15 @@ class SalomaoAgent:
             message_count=message_count,
         )
 
-        if not self.validate_response_scope(effective_message, result.message, conversation_context):
+        verified_grounded = self._verified_grounded_result(result, text_scope)
+        if verified_grounded:
+            logger.info("Validacao de escopo da resposta", extra={
+                "event": "scope.output_checked", "answer_status": "approved",
+                "decision_method": "verified_official_grounding", "decision_confidence": 1.0,
+                "decision_reason": "inchurch_input_and_allowlisted_sources",
+                "source_count": len(result.sources),
+            })
+        elif not self.validate_response_scope(effective_message, result.message, conversation_context):
             result = SalomaoPipelineResponse(message=SCOPE_UNAVAILABLE, answer_status="scope_blocked",
                 model_name="scope_guard", route="ESCOPO_BLOQUEADO", agent_trace=["output_scope_blocked"])
 

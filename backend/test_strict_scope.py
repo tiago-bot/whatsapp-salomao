@@ -46,6 +46,57 @@ class StrictScopeTests(unittest.TestCase):
             self.assertFalse(self.agent.validate_response_scope("estorno", SPORTS, HISTORY))
             model.assert_not_called()
 
+    def test_verified_official_grounding_does_not_depend_on_probabilistic_guard(self):
+        result = agent_module.SalomaoPipelineResponse(
+            message="Acesse Financeiro > Entradas para localizar a transação.",
+            answer_status="answered",
+            sources=[{"id": "refund", "title": "Estornos", "url": "https://portal.inchurch.com.br/pt-br/estorno"}],
+            agent_trace=["published_retrieval", "grounded_answer"],
+        )
+        scope = agent_module.TextScopeResult(
+            status=agent_module.ImageScopeStatus.INCHURCH,
+            confidence=1.0,
+        )
+        self.assertTrue(self.agent._verified_grounded_result(result, scope))
+
+    def test_grounded_provenance_never_overrides_external_content_or_untrusted_url(self):
+        scope = agent_module.TextScopeResult(
+            status=agent_module.ImageScopeStatus.INCHURCH,
+            confidence=1.0,
+        )
+        for message, url in [
+            (SPORTS, "https://portal.inchurch.com.br/pt-br/eventos"),
+            ("Acesse Financeiro > Entradas.", "https://example.com/falso"),
+        ]:
+            with self.subTest(message=message, url=url):
+                result = agent_module.SalomaoPipelineResponse(
+                    message=message,
+                    sources=[{"id": "source", "title": "Fonte", "url": url}],
+                    agent_trace=["published_retrieval", "grounded_answer"],
+                )
+                self.assertFalse(self.agent._verified_grounded_result(result, scope))
+
+    def test_verified_grounded_result_is_delivered_without_second_model_judgment(self):
+        grounded = agent_module.SalomaoPipelineResponse(
+            message="Acesse Financeiro > Entradas para localizar a transação.",
+            answer_status="answered",
+            sources=[{"id": "refund", "title": "Estornos", "url": "https://portal.inchurch.com.br/pt-br/estorno"}],
+            agent_trace=["published_retrieval", "grounded_answer"],
+        )
+        with patch.object(agent_module, "db") as db, \
+                patch.object(agent_module, "SalomaoSupervisorAgent") as supervisor, \
+                patch.object(self.agent, "_classify_text_scope", return_value=agent_module.TextScopeResult(
+                    status=agent_module.ImageScopeStatus.INCHURCH, confidence=1.0)), \
+                patch.object(self.agent, "validate_response_scope") as semantic_guard, \
+                patch.object(self.agent, "_record_turn_metric"), \
+                patch.object(self.agent, "refresh_conversation_summary"):
+            db.get_message_count.return_value = 0
+            supervisor.return_value.run_pipeline.return_value = grounded
+            result = self.agent.process_message("quero fazer estorno", session_id="synthetic", conversation_history=[])
+        self.assertEqual(result["answer_status"], "answered")
+        self.assertIn("Financeiro > Entradas", result["response"])
+        semantic_guard.assert_not_called()
+
     def test_output_validation_requires_strict_positive_high_confidence(self):
         for content, expected in [({"approved": True, "confidence": .99}, True),
                 ({"approved": True, "confidence": .5}, False), ({"approved": False, "confidence": 1}, False),

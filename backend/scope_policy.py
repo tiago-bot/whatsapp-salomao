@@ -8,7 +8,7 @@ import json
 import re
 import unicodedata
 
-SCOPE_POLICY_VERSION = "2026-09-02-strict-v1"
+SCOPE_POLICY_VERSION = "2026-09-04-grounded-v2"
 SCOPE_REDIRECT = "Meu foco aqui é ajudar com a plataforma inChurch. Podemos retomar sua dúvida sobre ela."
 SCOPE_CLARIFY = "Quero entender melhor para te orientar: a qual função ou tela da inChurch você está se referindo?"
 SCOPE_UNAVAILABLE = "Não consegui validar uma orientação segura agora. Tente novamente em instantes ou peça para falar com um atendente."

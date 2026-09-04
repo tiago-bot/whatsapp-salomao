@@ -53,6 +53,20 @@ class LoggingTests(unittest.TestCase):
         self.assertEqual(json.loads(output)["error_type"], "ValueError")
         self.assertIn("stack", json.loads(output))
 
+    def test_scope_decision_is_explainable_without_customer_content(self):
+        formatter = JsonFormatter()
+        record = logging.LogRecord("salomao", logging.INFO, __file__, 1,
+            "Validacao de escopo da resposta", (), None)
+        record.event = "scope.output_checked"
+        record.answer_status = "approved"
+        record.decision_method = "verified_official_grounding"
+        record.decision_confidence = 1.0
+        record.decision_reason = "inchurch_input_and_allowlisted_sources"
+        data = json.loads(formatter.format(record))
+        self.assertEqual(data["decision_method"], "verified_official_grounding")
+        self.assertEqual(data["decision_confidence"], 1.0)
+        self.assertEqual(data["decision_reason"], "inchurch_input_and_allowlisted_sources")
+
     def test_application_and_uvicorn_use_stdout_with_real_severity(self):
         code = '''import logging
 from logging_config import configure_logging
