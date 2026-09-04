@@ -1,7 +1,7 @@
 # Imagem e áudio no WhatsApp — avaliação inicial
 
-Existe implementação parcial, mas não foi homologada ponta a ponta no WhatsApp.
-Não foi feito deploy nem ativada uma nova integração multimodal nesta revisão.
+Existe implementação funcional no backend e cobertura isolada, mas ainda falta a
+homologação ponta a ponta após o próximo deploy no WhatsApp.
 
 ## Imagens
 
@@ -25,16 +25,16 @@ HubSpot esteja pronta. [Entradas de imagem — OpenAI](https://developers.openai
 
 ## Áudio
 
-Existe transcrição via `whisper-1`. O caminho atual reconhece OGA/PTT/Opus como
-OGG, mas **trocar extensão não converte o codec**. O container atual não inclui
-FFmpeg. A documentação de transcrição lista MP3, MP4, MPEG, MPGA, M4A, WAV e WebM;
-não se deve assumir que o formato de voz recebido do WhatsApp será aceito.
+Existe transcrição via `gpt-transcribe`. O parser reconhece MP3, MP4, MPEG, MPGA,
+M4A, WAV e WebM pelo MIME, tipo ou nome/URL do arquivo. O caso real do HubSpot em
+que um M4A chega como `type=FILE` está coberto por regressão. O container inclui
+FFmpeg e converte OGG/Opus para WAV antes da transcrição.
 [Transcrição de arquivos — OpenAI](https://developers.openai.com/api/docs/guides/speech-to-text).
 
 Próximos passos:
 
-- Confirmar formato do áudio real e converter quando necessário, com FFmpeg
-  isolado, timeout, limite de duração/tamanho e limpeza segura de temporários.
+- Homologar um áudio real após o deploy e confirmar a transcrição e a resposta
+  contextual no ticket, sem conservar a mídia temporária.
 - Cachear a transcrição por conversa + ID de mensagem/anexo + versão do modelo,
   evitando custo repetido e mantendo legenda e transcrição nos acompanhamentos.
 - Persistir transcrição enriquecida separada do texto original: uma nova leitura

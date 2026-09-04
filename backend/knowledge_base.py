@@ -78,6 +78,42 @@ class KnowledgeBase:
 
         return keywords
 
+    @staticmethod
+    def _chunk_order(metadata: dict) -> tuple[int, str]:
+        raw = metadata.get("chunk_index", metadata.get("chunk", metadata.get("position", 10**9)))
+        try:
+            return int(raw), str(metadata.get("text", metadata.get("content", "")))
+        except (TypeError, ValueError):
+            return 10**9, str(raw)
+
+    @classmethod
+    def _combine_chunks(cls, chunks: list[dict]) -> str:
+        """Reassemble a legacy article in document order, not similarity order."""
+        ordered = sorted(chunks, key=cls._chunk_order)
+        content = []
+        seen = set()
+        for chunk in ordered:
+            text = str(chunk.get("text", chunk.get("content", ""))).strip()
+            if text and text not in seen:
+                seen.add(text)
+                content.append(text)
+        return "\n\n".join(content)
+
+    def _article_chunks(self, embedding: list[float], url: str, article_id: str) -> list[dict]:
+        """Fetch every indexed chunk for one selected article."""
+        field, value = ("article_url", url) if url else ("article_id", article_id)
+        try:
+            result = self.index.query(
+                vector=embedding,
+                top_k=100,
+                filter={field: {"$eq": value}},
+                include_metadata=True,
+            )
+            return [match.metadata or {} for match in result.matches
+                    if str((match.metadata or {}).get(field, "")) == str(value)]
+        except Exception:
+            return []
+
     def search(
         self,
         query: str,
@@ -102,7 +138,9 @@ class KnowledgeBase:
 
         results = self.index.query(
             vector=embedding,
-            top_k=top_k,
+            # Retrieve enough candidates to rank articles instead of ranking
+            # isolated chunks from the same article.
+            top_k=max(12, top_k * 4),
             include_metadata=True
         )
 
@@ -120,14 +158,26 @@ class KnowledgeBase:
                 if url in published_by_url:
                     articles.append({**published_by_url[url], "score": match.score, "retrieval": "semantic_published"})
                     continue
+                chunks = self._article_chunks(embedding, url, str(article_id))
+                content = self._combine_chunks(chunks) or metadata.get("text", metadata.get("content", ""))
                 articles.append({
                     "id": article_id,
                     "score": match.score,
                     "title": metadata.get("article_title", metadata.get("title", "Sem título")),
-                    "content": metadata.get("text", metadata.get("content", "")),
+                    "content": content,
                     "url": url,
                     "category": metadata.get("category_name", metadata.get("category", ""))
                 })
+                if len(articles) >= top_k:
+                    break
+
+        # The top legacy result is the one most likely to shape the answer.
+        # Replace its lossy chunks with the current, public official article.
+        if articles and articles[0].get("retrieval") != "semantic_published":
+            live = published_knowledge.hydrate_official_article(articles[0].get("url", ""))
+            if live:
+                articles[0]["content"] = live
+                articles[0]["retrieval"] = "official_live"
 
         return articles
 
@@ -142,13 +192,15 @@ class KnowledgeBase:
             # Restrict the semantic index lookup to the exact official article.
             results = self.index.query(vector=self._get_embedding(url), top_k=8,
                 filter={"article_url": {"$eq": url}}, include_metadata=True)
-            chunks = [match.metadata for match in results.matches
+            chunks = [match.metadata or {} for match in results.matches
                       if (match.metadata or {}).get("article_url") == url]
             if chunks:
+                chunks.sort(key=self._chunk_order)
                 first = chunks[0]
+                content = published_knowledge.hydrate_official_article(url) or self._combine_chunks(chunks)
                 found.append({"id": str(first.get("article_id") or url),
                     "title": first.get("article_title", "Documentação inChurch"), "url": url,
-                    "content": "\n\n".join(dict.fromkeys(c.get("text", "") for c in chunks)),
+                    "content": content,
                     "category": first.get("category_name", ""), "retrieval": "previous_source"})
         return found
 

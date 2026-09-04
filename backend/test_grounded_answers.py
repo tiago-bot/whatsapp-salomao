@@ -10,7 +10,7 @@ for key, value in {"OPENAI_API_KEY": "test-key", "PINECONE_API_KEY": "test-key",
     os.environ.setdefault(key, value)
 
 import salomao_agent as m
-from published_knowledge import PublishedKnowledge, contextual_query, safe_url
+from published_knowledge import PublishedKnowledge, _OfficialArticleParser, contextual_query, safe_url
 from knowledge_base import KnowledgeBase
 
 DOCS = [
@@ -49,6 +49,7 @@ class GroundedAnswers(unittest.TestCase):
         with patch("knowledge_base.published_knowledge") as published:
             published.search.return_value = []
             published.by_url.return_value = {DOCS[0]["url"]: DOCS[0]}
+            published.hydrate_official_article.return_value = ""
             result = kb.search("extorno")
             self.assertEqual(result[0]["content"], DOCS[0]["content"])
             self.assertEqual(result[0]["url"], DOCS[0]["url"])
@@ -56,6 +57,38 @@ class GroundedAnswers(unittest.TestCase):
             result = kb.search("extorno")
             self.assertEqual(result[0]["title"], "Título original")
             self.assertEqual(result[0]["category"], "Financeiro")
+
+    def test_legacy_chunks_are_reassembled_in_article_order_then_hydrated(self):
+        kb = object.__new__(KnowledgeBase)
+        kb.index = MagicMock()
+        kb._get_embedding = MagicMock(return_value=[0.1])
+        first = SimpleNamespace(id="refund-2", score=.9, metadata={
+            "article_id": "refund", "article_title": "Estorno", "article_url": DOCS[0]["url"],
+            "chunk_index": 2, "text": "Segundo passo."})
+        chunks = [first, SimpleNamespace(id="refund-1", score=.8, metadata={
+            "article_id": "refund", "article_title": "Estorno", "article_url": DOCS[0]["url"],
+            "chunk_index": 1, "text": "Primeiro passo."})]
+        kb.index.query.side_effect = [SimpleNamespace(matches=[first]), SimpleNamespace(matches=chunks)]
+        with patch("knowledge_base.published_knowledge") as published:
+            published.search.return_value = []
+            published.by_url.return_value = {}
+            published.hydrate_official_article.return_value = "Artigo oficial completo."
+            result = kb.search("estorno", top_k=1)
+        self.assertEqual(result[0]["content"], "Artigo oficial completo.")
+        self.assertEqual(result[0]["retrieval"], "official_live")
+        self.assertEqual(kb.index.query.call_args_list[1].kwargs["filter"],
+                         {"article_url": {"$eq": DOCS[0]["url"]}})
+
+    def test_official_article_parser_excludes_navigation_and_scripts(self):
+        parser = _OfficialArticleParser()
+        parser.feed("<nav>Menu externo</nav><article class='knowledgebase-post'><h1>Estorno</h1>"
+                    "<p>Acesse <strong>Financeiro &gt; Entradas</strong>.</p>"
+                    "<script>segredo()</script></article><footer>Rodapé</footer>")
+        content = parser.text()
+        self.assertIn("Financeiro > Entradas", content)
+        self.assertNotIn("Menu externo", content)
+        self.assertNotIn("segredo", content)
+        self.assertNotIn("Rodapé", content)
 
     def test_ambiguous_spelling_does_not_choose_unrelated_article(self):
         self.assertEqual(self.catalog.search("como fazer extorno"), [])
@@ -107,6 +140,17 @@ class GroundedAnswers(unittest.TestCase):
             result = self.supervisor.run_pipeline(message="estorno")
             self.assertEqual(result.answer_status, "documentation")
             self.assertNotIn("Invented", result.message)
+
+    def test_exact_bad_refund_answer_is_rejected_when_article_has_steps(self):
+        bad = ("O estorno não é feito pela aba de Extrato. A documentação disponível "
+               "não detalha os caminhos ou telas exatos para executar o estorno.")
+        with patch.object(m.knowledge_base, "search", return_value=DOCS[:1]), patch.object(m, "Agent") as agent:
+            agent.return_value.run.return_value = SimpleNamespace(status="COMPLETED", content={
+                "answer": bad, "source_ids": ["refund"]})
+            result = self.supervisor.run_pipeline(message="quero fazer estorno")
+        self.assertEqual(result.answer_status, "documentation")
+        self.assertIn("Financeiro > Entradas", result.message)
+        self.assertNotIn("não detalha", result.message)
 
     def test_missing_object_gets_focused_clarification(self):
         with patch.object(m.knowledge_base, "search", return_value=[]), patch.object(m, "Agent") as agent:

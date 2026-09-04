@@ -250,6 +250,22 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual(self.agent.process_message.call_args.kwargs["image_mime_type"], "image/png")
         self.assertEqual(self.agent.process_message.call_args.kwargs["originating_channel"], "whatsapp")
 
+    def test_hubspot_file_with_m4a_extension_is_transcribed_as_audio(self):
+        attachment = {"type": "FILE", "name": "mensagem.m4a",
+                      "url": "https://47354717.cdnp1.hubspotusercontent-na1.net/file.m4a?signature=hidden"}
+        with patch.object(self.bot, "_download_attachment_as_base64", return_value="YWJj"):
+            result = self.bot.process_message("t1", self.message(text="", raw={"attachments": [attachment]}))
+        kwargs = self.agent.process_message.call_args.kwargs
+        self.assertEqual(kwargs["audio_format"], "m4a")
+        self.assertEqual(kwargs["audio_base64"], "YWJj")
+        self.assertNotIn("anexo", result["response"].lower())
+
+    def test_model_value_error_is_not_misreported_as_bad_attachment(self):
+        self.agent.process_message.side_effect = ValueError("model_failure")
+        result = self.bot.process_message("t1", self.message())
+        self.assertNotIn("anexo", result["response"].lower())
+        self.assertEqual(result["answer_status"], "unavailable")
+
     def test_untrusted_attachment_does_not_receive_credentials(self):
         with patch.object(bot_module.requests, "get") as get:
             with self.assertRaises(ValueError):

@@ -38,6 +38,8 @@ class HubSpotSalomaoBot:
     MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
     MAX_DEBOUNCE_WAIT_SECONDS = 20
     MAX_GENERATIONS_PER_CYCLE = 3
+    AUDIO_EXTENSIONS = {"mp3", "mp4", "mpeg", "mpga", "m4a", "wav", "webm", "ogg", "oga", "opus", "ptt"}
+    IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "webp", "gif"}
 
     def __init__(self, store=None, agent=None, memory=None, debounce_seconds=None):
         self.debounce_seconds = HUBSPOT_MESSAGE_DEBOUNCE_SECONDS if debounce_seconds is None else max(0, debounce_seconds)
@@ -173,18 +175,40 @@ class HubSpotSalomaoBot:
         if parsed.scheme != "https" or parsed.username or not any(host == d or host.endswith("." + d) for d in allowed):
             raise ValueError("unsupported_attachment_host")
         headers = get_headers() if host == "api.hubapi.com" else {}
-        with requests.get(url, headers=headers, timeout=20, stream=True, allow_redirects=False) as response:
-            response.raise_for_status()
-            if 300 <= response.status_code < 400:
-                raise ValueError("attachment_redirect_not_allowed")
-            if int(response.headers.get("Content-Length", 0)) > self.MAX_ATTACHMENT_BYTES:
-                raise ValueError("attachment_too_large")
-            data = bytearray()
-            for part in response.iter_content(65536):
-                data.extend(part)
-                if len(data) > self.MAX_ATTACHMENT_BYTES:
+        try:
+            with requests.get(url, headers=headers, timeout=20, stream=True, allow_redirects=False) as response:
+                response.raise_for_status()
+                if 300 <= response.status_code < 400:
+                    raise ValueError("attachment_redirect_not_allowed")
+                if int(response.headers.get("Content-Length", 0)) > self.MAX_ATTACHMENT_BYTES:
                     raise ValueError("attachment_too_large")
+                data = bytearray()
+                for part in response.iter_content(65536):
+                    data.extend(part)
+                    if len(data) > self.MAX_ATTACHMENT_BYTES:
+                        raise ValueError("attachment_too_large")
+                content_type = response.headers.get("Content-Type", "").split(";", 1)[0].lower()
+        except ValueError:
+            raise
+        except requests.RequestException:
+            raise ValueError("attachment_download_failed") from None
+        logger.info("Anexo baixado", extra={"event": "attachment.downloaded",
+            "attachment_bytes": len(data), "content_type": content_type})
         return base64.b64encode(data).decode("ascii")
+
+    @staticmethod
+    def _attachment_extension(attachment):
+        candidates = [urlsplit(str(attachment.get("url", ""))).path,
+                      str(attachment.get("name") or attachment.get("fileName") or "")]
+        extensions = []
+        for candidate in candidates:
+            leaf = candidate.rsplit("/", 1)[-1]
+            if "." in leaf:
+                extension = leaf.rsplit(".", 1)[-1].lower().strip()
+                if extension:
+                    extensions.append(extension)
+        known = HubSpotSalomaoBot.AUDIO_EXTENSIONS | HubSpotSalomaoBot.IMAGE_EXTENSIONS
+        return next((extension for extension in extensions if extension in known), extensions[0] if extensions else "")
 
     def process_message(self, thread_id, message):
         message_text = message.get("text", "")
@@ -209,35 +233,48 @@ class HubSpotSalomaoBot:
         logger.info("Contexto da conversa preparado", extra={"event": "context.loaded", "thread_id": str(thread_id),
             "message_id": message.get("id"), "context_messages": len(selected), "context_truncated": truncated,
             "context_chars": sum(len(m["content"]) for m in selected), "source": "hubspot_and_delivery_cache"})
+        if attachments:
+            logger.info("Anexos recebidos", extra={"event": "attachment.received", "thread_id": str(thread_id),
+                "message_id": message.get("id"), "attachment_count": len(attachments)})
         try:
             for attachment in attachments:
                 url = attachment.get("url", "")
                 kind = str(attachment.get("type", "")).lower()
                 mime = attachment.get("mimeType") or attachment.get("contentType") or mimetypes.guess_type(urlsplit(url).path)[0] or ""
-                extension = urlsplit(url).path.rsplit(".", 1)[-1].lower()
-                if mime.startswith("image/") or kind == "image":
+                extension = self._attachment_extension(attachment)
+                logger.info("Anexo classificado", extra={"event": "attachment.classified",
+                    "attachment_kind": kind or "unknown", "attachment_format": extension or "unknown",
+                    "content_type": mime or "unknown"})
+                if mime.startswith("image/") or kind == "image" or extension in self.IMAGE_EXTENSIONS:
                     if "image_base64" in kwargs:
                         raise ValueError("multiple_images")
                     kwargs["image_base64"] = self._download_attachment_as_base64(url)
                     kwargs["image_mime_type"] = mime if mime.startswith("image/") else "image/jpeg"
-                elif mime.startswith("audio/") or kind == "audio" or extension in {"ptt", "oga", "opus"}:
+                elif mime.startswith("audio/") or kind == "audio" or extension in self.AUDIO_EXTENSIONS:
                     if "audio_base64" in kwargs:
                         raise ValueError("multiple_audio")
                     kwargs["audio_base64"] = self._download_attachment_as_base64(url)
-                    kwargs["audio_format"] = {"oga": "ogg", "ptt": "ogg", "opus": "ogg"}.get(extension, extension if extension in {"ogg", "mp3", "wav", "m4a", "webm", "mp4"} else "ogg")
+                    mime_format = {"audio/mpeg": "mp3", "audio/mp4": "mp4", "audio/x-m4a": "m4a",
+                                   "audio/wav": "wav", "audio/x-wav": "wav", "audio/webm": "webm",
+                                   "audio/ogg": "ogg"}.get(mime.lower(), "")
+                    kwargs["audio_format"] = {"oga": "ogg", "ptt": "ogg"}.get(
+                        extension, extension if extension in self.AUDIO_EXTENSIONS else mime_format or "mp4")
                 else:
                     raise ValueError("unsupported_attachment")
+        except ValueError as exc:
+            logger.warning("Anexo rejeitado", extra={"event": "attachment.rejected", "reason": str(exc),
+                "thread_id": str(thread_id), "message_id": message.get("id")})
+            return {"response": "Não consegui ler esse anexo. Envie uma imagem ou áudio por vez, ou descreva a dúvida em texto.",
+                    "success": False, "transfer_requested": False, "answer_status": "unavailable", "scope_policy_version": SCOPE_POLICY_VERSION}
+        try:
             result = self.agent.process_message(
                 message=message_text,
                 session_id=self.get_session_id_for_thread(thread_id),
                 originating_channel="whatsapp", **kwargs,
             )
-        except ValueError:
-            return {"response": "Não consegui ler esse anexo. Envie uma imagem ou áudio por vez, ou descreva a dúvida em texto.",
-                    "success": False, "transfer_requested": False, "answer_status": "unavailable", "scope_policy_version": SCOPE_POLICY_VERSION}
         except Exception as exc:
             logger.error("Message generation failed | type=%s", type(exc).__name__)
-            result = {"success": False}
+            result = {"success": False, "answer_status": "unavailable", "transfer_requested": False}
         if not result.get("response"):
             result["response"] = "Não consegui consultar a orientação agora. Tente novamente em instantes ou peça para falar com um atendente."
         if result.get("audio_transcription"):

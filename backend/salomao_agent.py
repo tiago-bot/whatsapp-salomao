@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 import tempfile
 import time
 import unicodedata
@@ -26,6 +27,7 @@ from config import (
     OPENAI_API_KEY,
     OPENAI_ORG_ID,
     OPENAI_PROJECT_ID,
+    TRANSCRIPTION_MODEL,
 )
 from database import db
 from event_service import analyze_event_visibility, fetch_event_details
@@ -308,10 +310,16 @@ Responda diretamente a intencao do cliente com base nos artigos fornecidos.
 Uma solicitacao como 'quero fazer estorno' pede orientacao de uso, nao que voce
 execute o estorno. Nao peca nome, CPF, valor, motivo ou identificador para
 ensinar um procedimento. Voce nao executa operacoes financeiras.
+Comece pela acao que o cliente pediu. Nao abra a resposta destacando uma tela
+onde a acao NAO e feita se o cliente nem mencionou essa tela. Excecoes e alertas
+entram depois do caminho pratico e somente quando ajudarem a executar ou evitar erro.
 Nao exija que a pessoa repita inChurch. Entenda sinonimos e continuacoes pelo
 historico, mas uma nova pergunta muda o assunto. Nao repita perguntas ja respondidas.
 Quando existir um caminho geral documentado, explique-o logo. Se houver caminhos
 distintos, de a orientacao comum e pergunte APENAS o detalhe que muda o procedimento.
+Se o artigo trouxer etapas ou nomes de telas em qualquer parte do conteudo, nunca
+afirme que ele nao detalha o caminho. Releia o artigo inteiro antes de declarar
+uma lacuna. Nao confunda um trecho incompleto com ausencia de documentacao.
 Uma palavra ambigua como 'cancelamento', sem objeto nem contexto, exige perguntar
 o que deseja cancelar; nao presuma inscricao, contrato ou pagamento.
 Priorize o artigo cujo titulo e modulo correspondem a pergunta. Se houver
@@ -334,6 +342,8 @@ Seja conciso: uma orientacao simples precisa de poucos passos, sem apresentacao,
 menus extensos, sugestoes genericas ou encerramento automatico oferecendo ajuda.
 Em continuacoes, responda o detalhe pedido sobre o objeto em andamento: depois de
 cadastro de membro, 'quais sao os obrigatorios?' pede os campos desse cadastro.
+Uma transcricao de audio e a mensagem do cliente: interprete-a no mesmo contexto
+das mensagens anteriores e responda ao pedido, sem comentar o formato do audio.
 Releia a fonte enviada anteriormente e confirme os dados nela. Nao reinicie o
 tutorial, nao troque o modulo e nao transfira uma pergunta que a fonte responde.
 Se a orientacao anterior estiver errada, corrija-a com clareza e base na fonte.
@@ -869,6 +879,11 @@ class SalomaoSupervisorAgent:
             # A procedural answer without evidence must never reach the customer.
             if not sources and not answer.needs_clarification and not answer.insufficient_knowledge:
                 return self._documentation_response(articles, query, triage)
+            if self._grounding_conflict(answer.answer, articles, message):
+                logger.warning("Resposta contradiz artigo recuperado", extra={
+                    "event": "knowledge.answer_rejected", "reason": "grounding_conflict",
+                    "source_count": len(articles)})
+                return self._documentation_response(articles, query, triage)
             # URLs and source labels are assembled from retrieval, not the model.
             text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", answer.answer)
             text = re.sub(r"https?://\S+", "", text)
@@ -888,6 +903,29 @@ class SalomaoSupervisorAgent:
             _answer_model_retry_at = time.monotonic() + 60
             logger.warning("Resposta generativa indisponivel; usando documentos | type=%s", type(exc).__name__)
             return self._documentation_response(articles, query, triage)
+
+    @staticmethod
+    def _grounding_conflict(answer: str, articles: list[dict], question: str) -> bool:
+        """Block two recurring failures that can be checked without another model."""
+        normalized_answer = _normalize_text(answer)
+        normalized_question = _normalize_text(question)
+        normalized_sources = _normalize_text("\n".join(str(a.get("content") or "") for a in articles))
+        source_has_path = bool(re.search(
+            r"\b(acesse|clique|selecione|localize|va ate|financeiro\s*>\s*entradas)\b",
+            normalized_sources,
+        ))
+        false_gap = (source_has_path and
+            bool(re.search(r"documenta.{0,30}nao (detalha|informa|traz).{0,50}(caminho|passo|tela|como)",
+                           normalized_answer)))
+        # For a generic refund request, opening with "where not to do it" is
+        # irrelevant unless the customer actually asked about that screen.
+        opening = normalized_answer[:320]
+        negative_extrato_lead = (
+            "estorno" in normalized_question and "extrato" not in normalized_question and
+            "extrato" in opening and source_has_path and
+            bool(re.search(r"nao .{0,25}(extrato)|extrato.{0,25}nao", opening))
+        )
+        return false_gap or negative_extrato_lead
 
     @staticmethod
     def _documentation_response(articles: list[dict], query: str, triage: TriageResult) -> SalomaoPipelineResponse:
@@ -1389,6 +1427,17 @@ class SalomaoAgent:
         first_user = (user_messages[0].get("content") if user_messages else "") or first_turn.get("user_message") or ""
         latest_user = (user_messages[-1].get("content") if user_messages else "") or latest_turn.get("user_message") or ""
         latest_assistant = (assistant_messages[-1].get("content") if assistant_messages else "") or latest_turn.get("assistant_message") or ""
+        # Menu choices and greetings are transport/navigation, not the support
+        # problem. Otherwise summaries such as "problem: 1" poison handoffs.
+        meaningful_users = []
+        for item in user_messages:
+            content = str(item.get("content") or "").strip()
+            normalized = _normalize_text(content)
+            if (not content or re.fullmatch(r"\d+", normalized) or
+                    normalized in {"sim", "nao", "oi", "ola", "bom dia", "boa tarde", "boa noite"}):
+                continue
+            meaningful_users.append(content)
+        primary_problem = meaningful_users[0] if meaningful_users else (latest_user or first_user)
 
         route = latest_turn.get("route") or heuristic_triage(latest_user or first_user).rota.value
         tags = latest_turn.get("tags") or self._extract_topics_from_trace(latest_user or first_user)
@@ -1418,7 +1467,7 @@ class SalomaoAgent:
             "topic": topic,
             "module": module,
             "summary": summary_text,
-            "problem": (first_user or latest_user)[:700],
+            "problem": primary_problem[:700],
             "steps_given": steps,
             "resolution_status": status,
             "confidence_score": confidence,
@@ -1434,22 +1483,47 @@ class SalomaoAgent:
         return self._safe_db_call(None, db.upsert_conversation_summary, summary)
 
     def transcribe_audio(self, audio_data: bytes, audio_format: str = "wav") -> str:
+        allowed = {"mp3", "mp4", "mpeg", "mpga", "m4a", "wav", "webm", "ogg", "opus"}
+        audio_format = str(audio_format or "").lower().lstrip(".")
+        if audio_format not in allowed or not audio_data or len(audio_data) > 20 * 1024 * 1024:
+            raise ValueError("audio_invalid")
+        started = time.perf_counter()
+        logger.info("Transcricao iniciada", extra={"event": "audio.transcription_started",
+            "attachment_format": audio_format, "attachment_bytes": len(audio_data), "model": TRANSCRIPTION_MODEL})
         try:
-            with tempfile.NamedTemporaryFile(suffix=f".{audio_format}", delete=False) as temp:
-                temp.write(audio_data)
-                temp_path = temp.name
-            try:
-                with open(temp_path, "rb") as audio_file:
+            with tempfile.TemporaryDirectory() as folder:
+                input_path = os.path.join(folder, f"input.{audio_format}")
+                with open(input_path, "wb") as audio_file:
+                    audio_file.write(audio_data)
+                transcription_path = input_path
+                # WhatsApp can deliver Opus/Ogg even though the file
+                # transcription endpoint accepts a narrower set of containers.
+                if audio_format in {"ogg", "opus"}:
+                    transcription_path = os.path.join(folder, "transcription.wav")
+                    completed = subprocess.run(
+                        ["ffmpeg", "-nostdin", "-loglevel", "error", "-i", input_path,
+                         "-vn", "-ar", "16000", "-ac", "1", transcription_path],
+                        capture_output=True, timeout=30, check=False,
+                    )
+                    if completed.returncode != 0 or not os.path.exists(transcription_path):
+                        raise ValueError("audio_conversion_failed")
+                with open(transcription_path, "rb") as audio_file:
                     transcription = self.client.audio.transcriptions.create(
-                        model="whisper-1",
+                        model=TRANSCRIPTION_MODEL,
                         file=audio_file,
                         language="pt",
                     )
-                return transcription.text
-            finally:
-                os.unlink(temp_path)
+                text = transcription.text.strip()
+                if not text:
+                    raise ValueError("empty_transcription")
+                logger.info("Transcricao concluida", extra={"event": "audio.transcription_completed",
+                    "attachment_format": audio_format, "transcript_chars": len(text),
+                    "duration_ms": int((time.perf_counter() - started) * 1000), "model": TRANSCRIPTION_MODEL})
+                return text
         except Exception as exc:
-            logger.warning("Falha ao transcrever audio: %s", _sanitize_error(exc))
+            logger.warning("Falha ao transcrever audio", extra={"event": "audio.transcription_failed",
+                "attachment_format": audio_format, "duration_ms": int((time.perf_counter() - started) * 1000),
+                "error_type": type(exc).__name__, "model": TRANSCRIPTION_MODEL})
             raise ValueError("audio_unavailable") from None
 
     def process_message(

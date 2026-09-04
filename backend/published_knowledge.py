@@ -10,12 +10,13 @@ import time
 import unicodedata
 from collections import Counter
 from difflib import get_close_matches, SequenceMatcher
+from html.parser import HTMLParser
 from threading import Lock
 from urllib.parse import urlparse
 from scope_policy import explicit_external_request
 
 import httpx
-from config import KB_SUPABASE_URL, KB_SUPABASE_ANON_KEY
+from config import KB_SUPABASE_URL, KB_SUPABASE_ANON_KEY, KB_LIVE_ARTICLE_HYDRATION_ENABLED
 
 logger = logging.getLogger(__name__)
 STOP = set("a o as os de da do das dos em no na nos nas e ou um uma para por com que qual quais como onde quando fazer faco realizar quero preciso gostaria posso pode consigo funciona funcionar area opcao botao tela esse essa isso ele ela aqui agora nao sim meu minha ao se ser esta estar tem foi ainda sobre inchurch church in painel plataforma mais muito favor ajuda favor me pelo pela aparece aparecer sumiu so".split())
@@ -49,6 +50,49 @@ def terms(text: str) -> list[str]:
 def safe_url(url: str) -> bool:
     parsed = urlparse(url)
     return parsed.scheme == "https" and parsed.hostname == "portal.inchurch.com.br" and not parsed.username
+
+
+class _OfficialArticleParser(HTMLParser):
+    """Extract only the public KB article, excluding navigation and scripts."""
+
+    BLOCK_TAGS = {"article", "blockquote", "br", "div", "h1", "h2", "h3", "h4", "li", "ol", "p", "ul"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._article_depth = 0
+        self._ignored_depth = 0
+        self.parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        classes = set(dict(attrs).get("class", "").split())
+        if tag == "article" and "knowledgebase-post" in classes:
+            self._article_depth = 1
+            self.parts.append("\n")
+            return
+        if not self._article_depth:
+            return
+        self._article_depth += 1
+        if tag in {"script", "style", "noscript", "svg"}:
+            self._ignored_depth += 1
+        if not self._ignored_depth and tag in self.BLOCK_TAGS:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if not self._article_depth:
+            return
+        if tag in {"script", "style", "noscript", "svg"} and self._ignored_depth:
+            self._ignored_depth -= 1
+        if not self._ignored_depth and tag in self.BLOCK_TAGS:
+            self.parts.append("\n")
+        self._article_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if self._article_depth and not self._ignored_depth and data.strip():
+            self.parts.append(data.strip() + " ")
+
+    def text(self) -> str:
+        lines = [re.sub(r"\s+", " ", line).strip() for line in "".join(self.parts).splitlines()]
+        return "\n".join(line for line in lines if line)
 
 
 def contextual_query(query: str, history: str) -> str:
@@ -133,6 +177,41 @@ class PublishedKnowledge:
         self._loaded_at = 0.0
         self._retry_at = 0.0
         self._lock = Lock()
+        self._live_articles: dict[str, tuple[float, str]] = {}
+
+    def hydrate_official_article(self, url: str) -> str:
+        """Read the current official article when the legacy vector has partial chunks.
+
+        This is strictly allowlisted to the public inChurch Central, bounded and
+        cached. Failure leaves the caller's Pinecone content untouched.
+        """
+        if not KB_LIVE_ARTICLE_HYDRATION_ENABLED or not safe_url(url):
+            return ""
+        now = time.monotonic()
+        cached = self._live_articles.get(url)
+        if cached and now - cached[0] < 600:
+            return cached[1]
+        try:
+            with httpx.Client(timeout=8.0, follow_redirects=False) as client:
+                response = client.get(url, headers={"Accept": "text/html"})
+            response.raise_for_status()
+            if len(response.content) > 2 * 1024 * 1024:
+                raise ValueError("article_too_large")
+            content_type = response.headers.get("content-type", "").lower()
+            if "text/html" not in content_type:
+                raise ValueError("article_not_html")
+            parser = _OfficialArticleParser()
+            parser.feed(response.text)
+            content = parser.text()
+            if len(content) < 120:
+                raise ValueError("article_content_missing")
+            self._live_articles[url] = (now, content)
+            logger.info("Artigo oficial atualizado", extra={"event": "knowledge.article_hydrated", "source": "official_help_center"})
+            return content
+        except Exception as exc:
+            logger.warning("Artigo oficial indisponivel", extra={
+                "event": "knowledge.article_hydration_failed", "error_type": type(exc).__name__})
+            return ""
 
     def _load(self) -> list[dict]:
         if not KB_SUPABASE_URL or not KB_SUPABASE_ANON_KEY:

@@ -173,6 +173,23 @@ class HistoryDeliveryTests(unittest.TestCase):
         send.assert_not_called()
         self.assertEqual(result[0]["error"], "history_unavailable")
 
+    def test_summary_ignores_menu_choice_as_customer_problem(self):
+        agent = object.__new__(agent_module.SalomaoAgent)
+        history = [
+            {"role": "user", "content": "1", "created_at": "2026-09-04T20:18:44Z"},
+            {"role": "assistant", "content": "Qual é o problema?", "created_at": "2026-09-04T20:19:07Z"},
+            {"role": "user", "content": "quero fazer estorno", "created_at": "2026-09-04T20:19:40Z"},
+            {"role": "assistant", "content": "Acesse Financeiro > Entradas.", "created_at": "2026-09-04T20:20:06Z"},
+        ]
+        turns = [{"user_message": "quero fazer estorno", "assistant_message": history[-1]["content"],
+                  "route": "FINANCEIRO", "tags": ["financeiro"], "answer_status": "answered"}]
+        with patch.object(agent_module, "db") as db:
+            db.get_conversation_history.return_value = history
+            db.get_conversation_turns.return_value = turns
+            db.upsert_conversation_summary.side_effect = lambda payload: payload
+            summary = agent.refresh_conversation_summary("session")
+        self.assertEqual(summary["problem"], "quero fazer estorno")
+
 
 class HubSpotReadTests(unittest.TestCase):
     def test_ticket_query_requests_owner_and_entry_date(self):
