@@ -2,6 +2,13 @@
 
 Repositório de publicação: [tiago-bot/whatsapp-salomao](https://github.com/tiago-bot/whatsapp-salomao).
 
+## Imagens e áudios
+
+Somente prints com identificação visual confirmada da inChurch são liberados
+para análise. Áudios passam por validação e conversão, com tratamento de silêncio,
+arquivos inválidos e falhas de transcrição. Limites, dependências e testes:
+**[leitura de imagens e áudios](docs/media-processing.md)**.
+
 ## Segurança e prontidão do WhatsApp
 
 Antes de publicar `main_hubspot:app`, configure `ADMIN_API_TOKEN`,

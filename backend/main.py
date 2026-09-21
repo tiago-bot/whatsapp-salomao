@@ -10,6 +10,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from salomao_agent import salomao
 from database import db
+from media_processing import MAX_MEDIA_BYTES, MAX_BASE64_CHARS, AUDIO_FORMATS, normalize_audio_format
 import json
 import asyncio
 
@@ -37,10 +38,11 @@ app.add_middleware(
 
 
 class ChatRequest(BaseModel):
-    message: str
+    message: str = ""
     session_id: Optional[str] = None
-    image_base64: Optional[str] = None
-    audio_base64: Optional[str] = None
+    image_base64: Optional[str] = Field(default=None, max_length=MAX_BASE64_CHARS)
+    image_mime_type: Optional[str] = None
+    audio_base64: Optional[str] = Field(default=None, max_length=MAX_BASE64_CHARS)
     audio_format: Optional[str] = "wav"
 
 
@@ -88,10 +90,11 @@ async def chat(request: ChatRequest):
     """
     session_id = request.session_id or str(uuid.uuid4())
 
-    result = salomao.process_message(
+    result = await asyncio.to_thread(salomao.process_message,
         message=request.message,
         session_id=session_id,
         image_base64=request.image_base64,
+        image_mime_type=request.image_mime_type,
         audio_base64=request.audio_base64,
         audio_format=request.audio_format or "wav"
     )
@@ -99,7 +102,7 @@ async def chat(request: ChatRequest):
     return ChatResponse(**result)
 
 
-@app.post("/chat/upload")
+@app.post("/chat/upload", response_model=ChatResponse)
 async def chat_with_upload(
     message: str = Form(""),
     session_id: Optional[str] = Form(None),
@@ -116,20 +119,33 @@ async def chat_with_upload(
     audio_base64 = None
     audio_format = "wav"
 
+    async def read_attachment(upload: UploadFile) -> bytes:
+        content = await upload.read(MAX_MEDIA_BYTES + 1)
+        if len(content) > MAX_MEDIA_BYTES:
+            raise HTTPException(status_code=413, detail="Cada anexo deve ter até 20 MB.")
+        if not content:
+            raise HTTPException(status_code=422, detail="O anexo está vazio. Envie o arquivo novamente.")
+        return content
+
     if image:
-        image_content = await image.read()
+        image_content = await read_attachment(image)
         image_base64 = base64.b64encode(image_content).decode("utf-8")
 
     if audio:
-        audio_content = await audio.read()
+        audio_content = await read_attachment(audio)
         audio_base64 = base64.b64encode(audio_content).decode("utf-8")
         if audio.filename:
-            audio_format = audio.filename.split(".")[-1] if "." in audio.filename else "wav"
+            audio_format = normalize_audio_format(audio.filename.rsplit(".", 1)[-1])
+        if audio_format not in AUDIO_FORMATS or not audio.filename or "." not in audio.filename:
+            audio_format = normalize_audio_format(audio.content_type)
+            if audio_format not in AUDIO_FORMATS:
+                audio_format = "wav"  # The decoder identifies the real container from its bytes.
 
-    result = salomao.process_message(
+    result = await asyncio.to_thread(salomao.process_message,
         message=message,
         session_id=session_id,
         image_base64=image_base64,
+        image_mime_type=image.content_type if image else None,
         audio_base64=audio_base64,
         audio_format=audio_format
     )

@@ -1,9 +1,12 @@
 """Offline regression tests: no external calls or production writes."""
 import json
+import base64
+from io import BytesIO
 import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+from PIL import Image
 
 # Allow a clean checkout to run the suite without real credentials.
 os.environ.setdefault("OPENAI_API_KEY", "test-key")
@@ -74,15 +77,19 @@ class ScopeRegressions(unittest.TestCase):
                 # Rejected turns must also be available for a subsequent clarification.
                 self.assertEqual(db.add_message.call_count, 2)
 
-    def test_uncertain_screenshot_continues_to_pipeline(self):
+    def test_uncertain_screenshot_never_reaches_pipeline(self):
+        image = BytesIO()
+        Image.new("RGB", (40, 40), "white").save(image, format="PNG")
         with patch.object(module, "db") as db, patch.object(module, "SalomaoSupervisorAgent") as supervisor, patch.object(self.agent, "_classify_image_scope", return_value=module.ImageScopeResult()), patch.object(self.agent, "refresh_conversation_summary"), patch.object(self.agent, "_record_turn_metric"):
             db.get_message_count.return_value = 0
             db.get_conversation_history.return_value = []
             db.add_message.return_value = {}
             supervisor.return_value.run_pipeline.return_value = module.SalomaoPipelineResponse(message="Qual tela você está usando?", model_name="test")
-            result = self.agent.process_message("receita", image_base64="aW1hZ2U=", session_id="local-image-test")
-            self.assertEqual(result["model_used"], "test")
-            supervisor.return_value.run_pipeline.assert_called_once()
+            result = self.agent.process_message("receita", image_base64=base64.b64encode(image.getvalue()).decode(), session_id="local-image-test")
+            self.assertEqual(result["model_used"], "image_scope_guard")
+            self.assertEqual(result["answer_status"], "clarification")
+            supervisor.assert_not_called()
+            self.assertEqual(db.add_message.call_count, 2)
 
     def test_recent_messages_are_returned_in_chronological_order(self):
         database = object.__new__(ConversationDatabase)

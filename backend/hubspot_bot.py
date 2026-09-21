@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 import logging
 import mimetypes
 from threading import Lock
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 import uuid
 import time
 
@@ -16,6 +16,7 @@ from conversation_memory import SupabaseConversationMemory
 from delivery_store import DeliveryStore
 from conversation_context import bounded_history, history_before, message_time
 from logging_config import log_context
+from media_processing import MAX_MEDIA_BYTES, AUDIO_FORMATS, AUDIO_MIME_FORMATS, normalize_audio_format
 from handoff import requests_human
 from handoff_note import build_handoff_note
 from salomao_agent import salomao
@@ -35,10 +36,10 @@ logger = logging.getLogger("salomao.hubspot_bot")
 
 class HubSpotSalomaoBot:
     MESSAGE_MAX_AGE_MINUTES = 5
-    MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
+    MAX_ATTACHMENT_BYTES = MAX_MEDIA_BYTES
     MAX_DEBOUNCE_WAIT_SECONDS = 20
     MAX_GENERATIONS_PER_CYCLE = 3
-    AUDIO_EXTENSIONS = {"mp3", "mp4", "mpeg", "mpga", "m4a", "wav", "webm", "ogg", "oga", "opus", "ptt"}
+    AUDIO_EXTENSIONS = AUDIO_FORMATS | {"oga", "ptt"}
     IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "webp", "gif"}
 
     def __init__(self, store=None, agent=None, memory=None, debounce_seconds=None):
@@ -152,28 +153,38 @@ class HubSpotSalomaoBot:
         return groups
 
     def _download_attachment_as_base64(self, url):
-        parsed = urlsplit(url)
-        host = (parsed.hostname or "").lower()
-        # Never send the HubSpot bearer token to arbitrary attachment URLs.
+        # Validate every redirect and recompute headers; signed CDN links can
+        # redirect legitimately but must never receive the HubSpot bearer token.
         allowed = ("hubapi.com", "hubspot.com", "hubspotusercontent.com",
                    "hubspotusercontent-na1.net", "hubspotusercontent-eu1.net",
                    "hsusercontent.com")
-        if parsed.scheme != "https" or parsed.username or not any(host == d or host.endswith("." + d) for d in allowed):
-            raise ValueError("unsupported_attachment_host")
-        headers = get_headers() if host == "api.hubapi.com" else {}
         try:
-            with requests.get(url, headers=headers, timeout=20, stream=True, allow_redirects=False) as response:
-                response.raise_for_status()
-                if 300 <= response.status_code < 400:
-                    raise ValueError("attachment_redirect_not_allowed")
-                if int(response.headers.get("Content-Length", 0)) > self.MAX_ATTACHMENT_BYTES:
-                    raise ValueError("attachment_too_large")
-                data = bytearray()
-                for part in response.iter_content(65536):
-                    data.extend(part)
-                    if len(data) > self.MAX_ATTACHMENT_BYTES:
+            for attempt in range(4):
+                parsed = urlsplit(url)
+                host = (parsed.hostname or "").lower()
+                if (parsed.scheme != "https" or parsed.username or parsed.port not in {None, 443}
+                        or not any(host == d or host.endswith("." + d) for d in allowed)):
+                    raise ValueError("unsupported_attachment_host")
+                headers = get_headers() if host == "api.hubapi.com" else {}
+                with requests.get(url, headers=headers, timeout=20, stream=True, allow_redirects=False) as response:
+                    response.raise_for_status()
+                    if 300 <= response.status_code < 400:
+                        location = response.headers.get("Location")
+                        if response.status_code not in {301, 302, 303, 307, 308} or not location or attempt == 3:
+                            raise ValueError("attachment_redirect_not_allowed")
+                        url = urljoin(url, location)
+                        continue
+                    if int(response.headers.get("Content-Length", 0)) > self.MAX_ATTACHMENT_BYTES:
                         raise ValueError("attachment_too_large")
-                content_type = response.headers.get("Content-Type", "").split(";", 1)[0].lower()
+                    data = bytearray()
+                    for part in response.iter_content(65536):
+                        data.extend(part)
+                        if len(data) > self.MAX_ATTACHMENT_BYTES:
+                            raise ValueError("attachment_too_large")
+                    if not data:
+                        raise ValueError("attachment_empty")
+                    content_type = response.headers.get("Content-Type", "").split(";", 1)[0].lower()
+                    break
         except ValueError:
             raise
         except requests.RequestException:
@@ -226,7 +237,8 @@ class HubSpotSalomaoBot:
             for attachment in attachments:
                 url = attachment.get("url", "")
                 kind = str(attachment.get("type", "")).lower()
-                mime = attachment.get("mimeType") or attachment.get("contentType") or mimetypes.guess_type(urlsplit(url).path)[0] or ""
+                mime = str(attachment.get("mimeType") or attachment.get("contentType") or
+                           mimetypes.guess_type(urlsplit(url).path)[0] or "").split(";", 1)[0].strip().lower()
                 extension = self._attachment_extension(attachment)
                 logger.info("Anexo classificado", extra={"event": "attachment.classified",
                     "attachment_kind": kind or "unknown", "attachment_format": extension or "unknown",
@@ -236,15 +248,12 @@ class HubSpotSalomaoBot:
                         raise ValueError("multiple_images")
                     kwargs["image_base64"] = self._download_attachment_as_base64(url)
                     kwargs["image_mime_type"] = mime if mime.startswith("image/") else "image/jpeg"
-                elif mime.startswith("audio/") or kind == "audio" or extension in self.AUDIO_EXTENSIONS:
+                elif mime in AUDIO_MIME_FORMATS or mime.startswith("audio/") or kind == "audio" or extension in self.AUDIO_EXTENSIONS:
                     if "audio_base64" in kwargs:
                         raise ValueError("multiple_audio")
                     kwargs["audio_base64"] = self._download_attachment_as_base64(url)
-                    mime_format = {"audio/mpeg": "mp3", "audio/mp4": "mp4", "audio/x-m4a": "m4a",
-                                   "audio/wav": "wav", "audio/x-wav": "wav", "audio/webm": "webm",
-                                   "audio/ogg": "ogg"}.get(mime.lower(), "")
-                    kwargs["audio_format"] = {"oga": "ogg", "ptt": "ogg"}.get(
-                        extension, extension if extension in self.AUDIO_EXTENSIONS else mime_format or "mp4")
+                    kwargs["audio_format"] = normalize_audio_format(
+                        extension if extension in self.AUDIO_EXTENSIONS else AUDIO_MIME_FORMATS.get(mime, "mp4"))
                 else:
                     raise ValueError("unsupported_attachment")
         except ValueError as exc:

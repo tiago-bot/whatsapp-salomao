@@ -36,6 +36,7 @@ if __name__ == "__main__":
             "test_message_debounce",
             "test_delivery_recovery",
             "test_security_operations",
+            "test_media_processing",
         ])
         result = unittest.TextTestRunner(verbosity=2).run(suite)
     isolated_data.cleanup()
