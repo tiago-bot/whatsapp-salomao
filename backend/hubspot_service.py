@@ -6,11 +6,13 @@ Permite buscar conversas, mensagens e enviar respostas via WhatsApp.
 import os
 import logging
 import requests
+import time
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from config import WHATSAPP_MAX_MESSAGE_LENGTH
 from whatsapp_formatting import format_whatsapp, message_length, whatsapp_rich_text
+from conversation_context import message_time
 
 load_dotenv()
 
@@ -295,18 +297,20 @@ def get_thread_by_id(thread_id: str) -> Optional[dict]:
         return None
 
 
-def get_thread_messages(thread_id: str, limit: int = 100, *, strict: bool = False) -> List[dict]:
+def get_thread_messages(thread_id: str, limit: int = 100, *, strict: bool = False, since=None) -> List[dict]:
     """Read the NEWEST window with pagination, then return chronological order.
 
     A failed page is never treated as a complete history by the delivery worker.
     Follow opaque cursors on our fixed API URL, never a server-provided URL.
+    With since, read through that intake boundary instead of truncating to limit;
+    include the last page for context, with admission handled by the inbox store.
     """
     try:
         url = f"{HUBSPOT_API_BASE}/conversations/v3/conversations/threads/{thread_id}/messages"
         limit = min(500, max(1, limit))
         params = {"limit": min(limit, 100), "sort": "-createdAt"}
         messages, seen_cursors = {}, set()
-        for page in range(10):
+        for page in range(100 if since is not None else 10):
             response = requests.get(url, headers=get_headers(), params=params, timeout=30)
             if response.status_code != 200:
                 logger.error("Falha ao ler historico", extra={"event": "history.fetch_failed",
@@ -317,7 +321,10 @@ def get_thread_messages(thread_id: str, limit: int = 100, *, strict: bool = Fals
                 if message.get("id"):
                     messages[str(message["id"])] = message
             after = (data.get("paging") or {}).get("next", {}).get("after")
-            if len(messages) >= limit or not after:
+            crossed_boundary = since is not None and any(
+                message_time(m.get("createdAt")) is not None and message_time(m["createdAt"]) < since
+                for m in data.get("results", []))
+            if not after or crossed_boundary or (since is None and len(messages) >= limit):
                 break
             if str(after) in seen_cursors:
                 raise HubSpotReadError("history_cursor_repeated")
@@ -325,7 +332,9 @@ def get_thread_messages(thread_id: str, limit: int = 100, *, strict: bool = Fals
             params["after"] = after
         else:
             raise HubSpotReadError("history_page_limit")
-        result = sorted(messages.values(), key=lambda m: (m.get("createdAt", ""), str(m.get("id", ""))))[-limit:]
+        result = sorted(messages.values(), key=lambda m: (m.get("createdAt", ""), str(m.get("id", ""))))
+        if since is None:
+            result = result[-limit:]
         logger.debug("Historico carregado", extra={"event": "history.fetched", "thread_id": str(thread_id),
                                                   "message_count": len(result), "page_count": page + 1})
         return result
@@ -819,20 +828,7 @@ def transfer_to_human(ticket_id: str) -> bool:
     Returns:
         True se sucesso, False caso contrário
     """
-    logger.info(f"Transferindo ticket {ticket_id} para humano...")
-
-    # Remove o proprietário
-    owner_cleared = update_ticket_owner(ticket_id, None)
-
-    # Move para pipeline de humano
-    moved = update_ticket_pipeline_status(ticket_id, HUMAN_PIPELINE, HUMAN_STATUS)
-
-    if owner_cleared and moved:
-        logger.info(f"Ticket {ticket_id} transferido para humano com sucesso")
-        return True
-    else:
-        logger.error(f"Falha ao transferir ticket {ticket_id} para humano")
-        return False
+    return transfer_ticket_to_human_support(ticket_id)
 
 
 def get_tickets_for_salomao(*, strict: bool = False) -> List[dict]:
@@ -883,21 +879,37 @@ def get_tickets_for_salomao(*, strict: bool = False) -> List[dict]:
             "limit": 100
         }
 
-        response = requests.post(url, headers=get_headers(), json=payload, timeout=30)
-
-        if response.status_code == 200:
-            data = response.json()
-            tickets = data.get("results", [])
-            logger.debug("Tickets elegiveis encontrados", extra={"event": "tickets.searched", "ticket_count": len(tickets)})
-            return tickets
-        else:
-            logger.error("Falha ao consultar tickets", extra={"event": "tickets.search_failed", "status_code": response.status_code})
-            if strict:
+        tickets, seen_ids, seen_cursors = [], set(), set()
+        while True:
+            response = requests.post(url, headers=get_headers(), json=dict(payload), timeout=30)
+            if response.status_code != 200:
                 raise HubSpotReadError("ticket_search_unavailable")
-            return []
+            data = response.json()
+            page = data.get("results")
+            if not isinstance(page, list) or any(not isinstance(t, dict) or not t.get("id") for t in page):
+                raise HubSpotReadError("ticket_search_invalid_page")
+            for ticket in page:
+                if str(ticket["id"]) not in seen_ids:
+                    seen_ids.add(str(ticket["id"]))
+                    tickets.append(ticket)
+            after = data.get("paging", {}).get("next", {}).get("after")
+            if after is None:
+                break
+            cursor = str(after)
+            if not page or cursor in seen_cursors:
+                raise HubSpotReadError("ticket_search_pagination_stalled")
+            seen_cursors.add(cursor)
+            payload["after"] = cursor
+            # Respect the CRM search limit while walking a large queue.
+            time.sleep(0.21)
+        logger.debug("Tickets elegiveis encontrados", extra={"event": "tickets.searched", "ticket_count": len(tickets)})
+        return tickets
 
     except HubSpotReadError:
-        raise
+        logger.exception("Busca de tickets incompleta", extra={"event": "tickets.search_failed"})
+        if strict:
+            raise
+        return []
     except Exception as e:
         logger.exception("Falha ao consultar tickets", extra={"event": "tickets.search_failed"})
         if strict:

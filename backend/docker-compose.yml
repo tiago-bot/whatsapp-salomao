@@ -10,6 +10,7 @@ services:
       - "8080:8080"
     environment:
       - PORT=8080
+      - DELIVERY_DB_PATH=/data/salomao-delivery.sqlite3
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - PINECONE_API_KEY=${PINECONE_API_KEY}
       - PINECONE_INDEX=${PINECONE_INDEX:-inchurch-knowledge}
@@ -18,18 +19,24 @@ services:
       - HUBSPOT_ACCESS_TOKEN=${HUBSPOT_ACCESS_TOKEN}
     env_file:
       - .env
+    volumes:
+      - delivery-data:/data
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/ready', timeout=5)"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 10s
+      start_period: 60s
     logging:
       driver: "json-file"
       options:
         max-size: "10m"
         max-file: "3"
+
+volumes:
+  delivery-data:
+    name: salomao-delivery-data
 
 networks:
   default:

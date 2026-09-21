@@ -2,6 +2,17 @@
 
 Repositório de publicação: [tiago-bot/whatsapp-salomao](https://github.com/tiago-bot/whatsapp-salomao).
 
+## Segurança e prontidão do WhatsApp
+
+Antes de publicar `main_hubspot:app`, configure `ADMIN_API_TOKEN`,
+`HUBSPOT_CLIENT_SECRET` e `HUBSPOT_WEBHOOK_URL`. As rotas administrativas e os
+históricos exigem `Authorization: Bearer <ADMIN_API_TOKEN>`. O webhook valida
+assinatura e persiste os eventos antes de responder. `/health` indica processo
+vivo; `/ready` retorna 503 quando o serviço não consegue operar.
+
+Configuração, compatibilidade de assinaturas, alertas e validação:
+**[segurança e operação](docs/security-operations.md)**.
+
 ## HubSpot: gatilho de entrada no atendimento
 
 - Pipeline: `636594474`.
@@ -44,6 +55,10 @@ cd backend
 
 Instale `backend/requirements-lock.txt` para reproduzir as versões validadas.
 Para o frontend, use Node 22.12+ ou 24, `npm ci`, `npm test` e `npm run build`.
+
+Persistência dos recibos, recuperação de pendências e comandos de reconciliação:
+**[procedimento operacional](docs/delivery-recovery.md)**. O Compose monta o
+volume `salomao-delivery-data` em `/data`; no Railway o volume é configurado no serviço.
 
 **Não use os scripts antigos `test_agent.py`, `test_hubspot.py` ou polling para
 testes offline:** eles podem acessar serviços reais.

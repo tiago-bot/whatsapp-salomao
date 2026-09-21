@@ -76,7 +76,9 @@ class HubSpotSalomaoBot:
         return ""
 
     def get_unprocessed_visitor_messages(self, thread_id):
-        messages = parse_incoming_messages(get_thread_messages(thread_id, strict=True))
+        scanned_at = datetime.now(timezone.utc)
+        cutoff = self.store.intake_cutoff(thread_id, scanned_at - timedelta(minutes=self.MESSAGE_MAX_AGE_MINUTES))
+        messages = parse_incoming_messages(get_thread_messages(thread_id, strict=True, since=cutoff))
         if self.memory and not self.store.conversation_messages(thread_id):
             restored = self.memory.load(thread_id)
             if restored:
@@ -84,26 +86,10 @@ class HubSpotSalomaoBot:
                 logger.warning("Historico recuperado; entradas antigas sem recibo nao serao reenviadas", extra={
                     "event": "memory.receipts_review", "thread_id": str(thread_id)})
         self.store.remember_messages(thread_id, messages)
-        cutoff = datetime.now(timezone.utc) - timedelta(minutes=self.MESSAGE_MAX_AGE_MINUTES)
-        pending = []
-        for message in messages:
-            if not message.get("is_from_visitor") or not message.get("id"):
-                continue
-            if self.store.get(thread_id, message["id"]):
-                continue
-            try:
-                created = datetime.fromisoformat(message.get("created_at", "").replace("Z", "+00:00"))
-                if created.tzinfo is None:
-                    created = created.replace(tzinfo=timezone.utc)
-                if created < cutoff:
-                    continue
-            except (ValueError, TypeError):
-                logger.warning("Ignoring message without a valid timestamp")
-                continue
-            pending.append(message)
+        pending = self.store.observe_pending(thread_id, messages, cutoff, scanned_at)
         logger.debug("Mensagens verificadas", extra={"event": "messages.scanned", "thread_id": str(thread_id),
-            "message_count": len(messages), "pending_count": len(pending), "skipped_count": len(messages) - len(pending)})
-        return sorted(pending, key=lambda msg: msg.get("created_at", ""))
+            "message_count": len(messages), "pending_count": len(pending)})
+        return pending
 
     def _save_memory(self, thread_id):
         if self.memory:
@@ -296,6 +282,19 @@ class HubSpotSalomaoBot:
         result["scope_policy_version"] = SCOPE_POLICY_VERSION
         return result
 
+    def _delivery_eligibility(self, thread_id, message_id, ticket_id):
+        """Unknown ownership defers; confirmed takeover retires the old draft."""
+        ticket = get_ticket_by_id(ticket_id) if ticket_id else None
+        reason = self._ineligible_reason(ticket)
+        if not reason:
+            return None
+        if reason.startswith("different_"):
+            self.store.quarantine(thread_id, message_id, "eligibility_changed")
+        logger.info("Entrega suspensa apos revalidacao do ticket", extra={
+            "event": "delivery.deferred", "thread_id": thread_id, "message_id": message_id, "reason": reason})
+        return {"message_id": message_id, "sent": False, "transferred": False,
+                "error": "eligibility_changed" if reason.startswith("different_") else "ticket_unavailable"}
+
     def _deliver(self, entry, ticket_id):
         # Never trust a caller's stale outbox snapshot.
         entry = self.store.get(entry["thread_id"], entry["message_id"])
@@ -310,6 +309,9 @@ class HubSpotSalomaoBot:
                 "thread_id": thread_id, "message_id": message_id, "reason": "scope_approval_missing_or_changed"})
             return {"message_id": message_id, "sent": False, "answer_status": "scope_blocked"}
         for index in range(entry["sent_parts"], len(payload["parts"])):
+            stopped = self._delivery_eligibility(thread_id, message_id, ticket_id)
+            if stopped:
+                return stopped
             state = self.store.begin_part(thread_id, message_id, index)
             if state == "confirmed":
                 continue
@@ -334,6 +336,9 @@ class HubSpotSalomaoBot:
             logger.info("Parte da resposta enviada", extra={"event": "delivery.part_sent", "thread_id": thread_id,
                 "message_id": message_id, "part": index + 1, "parts": len(payload["parts"])})
         if payload.get("transfer_requested"):
+            stopped = self._delivery_eligibility(thread_id, message_id, ticket_id)
+            if stopped:
+                return stopped
             note_body = payload.get("handoff_note_body")
             if not note_body:
                 note_body = build_handoff_note(
@@ -371,6 +376,10 @@ class HubSpotSalomaoBot:
                     "reason": note_state})
                 return {"message_id": message_id, "sent": True, "transferred": False,
                         "error": "handoff_note_uncertain", "needs_review": True}
+            # Creating the note may take time: re-read immediately before PATCH.
+            stopped = self._delivery_eligibility(thread_id, message_id, ticket_id)
+            if stopped:
+                return stopped
             if not ticket_id or not transfer_ticket_to_human_support(ticket_id):
                 # Parts remain confirmed; next poll retries only the handoff.
                 return {"message_id": message_id, "sent": True, "transferred": False,
@@ -402,6 +411,12 @@ class HubSpotSalomaoBot:
             if not self._eligible(get_ticket_by_id(ticket_id)):
                 return []
             responses = []
+            # Intake must continue even while an uncertain output holds the thread.
+            try:
+                pending = self.get_unprocessed_visitor_messages(thread_id)
+            except HubSpotReadError:
+                logger.warning("Processamento adiado: historico indisponivel", extra={"event": "turn.deferred", "reason": "history_unavailable"})
+                return [{"error": "history_unavailable", "sent": False}]
             for entry in self.store.pending(thread_id):
                 with log_context(thread_id=str(thread_id), ticket_id=str(ticket_id), message_id=entry["message_id"],
                                  session_id=self.get_session_id_for_thread(thread_id), run_id=entry["payload"].get("run_id")):
@@ -410,11 +425,6 @@ class HubSpotSalomaoBot:
                 responses.append(delivered)
                 if delivered.get("error") or delivered.get("transferred"):
                     return responses
-            try:
-                pending = self.get_unprocessed_visitor_messages(thread_id)
-            except HubSpotReadError:
-                logger.warning("Processamento adiado: historico indisponivel", extra={"event": "turn.deferred", "reason": "history_unavailable"})
-                return responses + [{"error": "history_unavailable", "sent": False}]
             generations = 0
             while pending and generations < self.MAX_GENERATIONS_PER_CYCLE:
                 pending = [m for m in pending if not self.store.get(thread_id, m["id"])]

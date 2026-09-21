@@ -1,5 +1,7 @@
 """API contract tests with all external work mocked."""
 import os
+import asyncio
+import config
 import unittest
 from unittest.mock import patch, AsyncMock
 from fastapi.testclient import TestClient
@@ -12,6 +14,11 @@ import salomao_agent
 
 
 class ApiTests(unittest.TestCase):
+    def setUp(self):
+        auth = patch.object(config, "ADMIN_API_TOKEN", "a" * 40)
+        auth.start()
+        self.addCleanup(auth.stop)
+
     def test_primary_model_uses_sol_with_xhigh_reasoning(self):
         with patch.object(salomao_agent, "DEFAULT_MODEL", "gpt-5.6-sol"), \
              patch.object(salomao_agent, "PRIMARY_REASONING_EFFORT", "xhigh"):
@@ -22,11 +29,10 @@ class ApiTests(unittest.TestCase):
     def test_entry_date_property_triggers_ticket_processing(self):
         for date in ["1788368227429", "2026-09-02T19:37:07.429Z"]:
             with self.subTest(date=date), patch.object(main_hubspot, "process_ticket_if_valid", new_callable=AsyncMock) as process:
-                response = TestClient(main_hubspot.app).post("/webhook/hubspot", json=[{
+                asyncio.run(main_hubspot.dispatch_webhook_event({
                     "subscriptionType": "ticket.propertyChange", "objectId": 123,
                     "propertyName": "hs_v2_date_entered_1269308450", "propertyValue": date,
-                }])
-                self.assertEqual(response.status_code, 200)
+                }))
                 process.assert_awaited_once_with("123")
 
     def test_other_properties_and_cleared_entry_dates_do_not_trigger(self):
@@ -36,10 +42,10 @@ class ApiTests(unittest.TestCase):
                  ("hs_v2_date_entered_1269308450", None)]
         for name, value in cases:
             with self.subTest(name=name, value=value), patch.object(main_hubspot, "process_ticket_if_valid", new_callable=AsyncMock) as process:
-                TestClient(main_hubspot.app).post("/webhook/hubspot", json={
+                asyncio.run(main_hubspot.dispatch_webhook_event({
                     "subscriptionType": "ticket.propertyChange", "objectId": 123,
                     "propertyName": name, "propertyValue": value,
-                })
+                }))
                 process.assert_not_awaited()
 
     def test_entry_webhook_still_checks_all_ticket_filters(self):
@@ -48,11 +54,11 @@ class ApiTests(unittest.TestCase):
             current = {**props}
             if changed:
                 current[changed] = "another-value"
-            with self.subTest(changed=changed), patch.object(main_hubspot, "get_ticket_by_id", return_value={"properties": current}), patch.object(main_hubspot, "process_single_ticket", return_value={}) as process:
-                TestClient(main_hubspot.app).post("/webhook/hubspot", json={
+            with self.subTest(changed=changed), patch.object(main_hubspot, "get_ticket_by_id", return_value={"properties": current}), patch.object(main_hubspot, "process_single_ticket", return_value={"success": True}) as process:
+                asyncio.run(main_hubspot.dispatch_webhook_event({
                     "subscriptionType": "ticket.propertyChange", "objectId": 123,
                     "propertyName": "hs_v2_date_entered_1269308450", "propertyValue": "1788368227429",
-                })
+                }))
                 if changed:
                     process.assert_not_called()
                 else:
@@ -84,7 +90,7 @@ class ApiTests(unittest.TestCase):
 
     def test_test_chat_uses_whatsapp_channel_without_sending(self):
         with patch.object(main_hubspot.salomao, "process_message", return_value={"success": True, "response": "*Olá*"}) as agent, patch.object(main_hubspot, "reply_to_visitor") as send:
-            result = TestClient(main_hubspot.app).post("/test/chat", params={"message": "oi", "session_id": "offline"})
+            result = TestClient(main_hubspot.app, headers={"Authorization": "Bearer " + "a" * 40}).post("/test/chat", params={"message": "oi", "session_id": "offline"})
         self.assertEqual(result.status_code, 200)
         self.assertEqual(agent.call_args.kwargs["originating_channel"], "whatsapp")
         send.assert_not_called()

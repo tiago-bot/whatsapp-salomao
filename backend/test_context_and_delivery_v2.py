@@ -95,6 +95,11 @@ class DurableDeliveryTests(unittest.TestCase):
         self.payload = {"response": "Orientação", "parts": ["Orientação"], "scope_policy_version": bot_module.SCOPE_POLICY_VERSION,
             "scope_digest": bot_module.approval_digest("Orientação", ["Orientação"])}
         self.entry = self.store.enqueue("t", "input", self.payload)
+        ownership = patch.object(bot_module, "get_ticket_by_id", return_value={"properties": {
+            "hs_pipeline": service.SALOMAO_PIPELINE, "hs_pipeline_stage": service.SALOMAO_STATUS,
+            "hubspot_owner_id": service.SALOMAO_ACTOR_ID.removeprefix("A-")}})
+        ownership.start()
+        self.addCleanup(ownership.stop)
 
     def test_timeout_is_not_resent_after_restart(self):
         with patch.object(bot_module, "reply_to_visitor", side_effect=TimeoutError) as send:

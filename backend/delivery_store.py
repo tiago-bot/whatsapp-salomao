@@ -4,17 +4,22 @@ Confirmed parts are never resent. A crash/timeout between remote acceptance and
 local confirmation still requires reconciliation (HubSpot has no idempotency key).
 """
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sqlite3
+import time
 from contextlib import contextmanager
 from conversation_context import message_time
 from process_lock import thread_lock
 
 
 class DeliveryStore:
-    def __init__(self, path):
-        self.path = str(path)
+    def __init__(self, path, *, initialize=True):
+        self.path = str(Path(path).resolve())
+        if not initialize:
+            if not Path(self.path).is_file():
+                raise ValueError("delivery_database_not_found")
+            return
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
             conn.execute("PRAGMA synchronous=FULL")
@@ -30,6 +35,9 @@ class DeliveryStore:
                 conn.execute("ALTER TABLE deliveries ADD COLUMN handoff_note_state TEXT NOT NULL DEFAULT 'pending'")
             if "handoff_note_id" not in columns:
                 conn.execute("ALTER TABLE deliveries ADD COLUMN handoff_note_id TEXT")
+            if "queued_at" not in columns:
+                conn.execute("ALTER TABLE deliveries ADD COLUMN queued_at REAL NOT NULL DEFAULT 0")
+                conn.execute("UPDATE deliveries SET queued_at=?", (time.time(),))
             conn.execute("""CREATE TABLE IF NOT EXISTS conversation_messages (
                 thread_id TEXT NOT NULL, message_id TEXT NOT NULL, created_at TEXT NOT NULL,
                 role TEXT NOT NULL, content TEXT NOT NULL,
@@ -45,6 +53,74 @@ class DeliveryStore:
                     (thread_id,message_id,part,state,attempted_at)
                     SELECT thread_id,message_id,sent_parts,'uncertain',? FROM deliveries
                     WHERE complete=0""", (datetime.now(timezone.utc).isoformat(),))
+            conn.execute("""CREATE TABLE IF NOT EXISTS inbound_pending (
+                thread_id TEXT NOT NULL, message_id TEXT NOT NULL,
+                created_at TEXT NOT NULL, payload TEXT NOT NULL,
+                PRIMARY KEY(thread_id,message_id))""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS intake_checkpoints (
+                thread_id TEXT PRIMARY KEY, scanned_at TEXT NOT NULL)""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS delivery_reconciliations (
+                id INTEGER PRIMARY KEY, thread_id TEXT NOT NULL, message_id TEXT NOT NULL,
+                kind TEXT NOT NULL, part INTEGER NOT NULL, remote_id TEXT NOT NULL,
+                operator TEXT NOT NULL, reason TEXT NOT NULL, reconciled_at TEXT NOT NULL,
+                previous_state TEXT NOT NULL, evidence TEXT NOT NULL,
+                UNIQUE(thread_id,message_id,kind,part), UNIQUE(kind,remote_id))""")
+
+    def intake_cutoff(self, thread_id, bootstrap_cutoff):
+        """Resume from the last successful scan, or a known outstanding send.
+
+        On first contact only the recent window is admitted. A legacy held send
+        supplies a narrower, evidenced recovery boundary, never the whole past.
+        """
+        boundaries = [bootstrap_cutoff]
+        with self._connect() as conn:
+            checkpoint = conn.execute("SELECT scanned_at FROM intake_checkpoints WHERE thread_id=?",
+                                      (str(thread_id),)).fetchone()
+            if checkpoint:
+                timestamp = message_time(checkpoint["scanned_at"])
+                if timestamp:
+                    boundaries.append(timestamp - timedelta(seconds=5))
+            rows = conn.execute("""SELECT a.attempted_at FROM delivery_attempts a
+                JOIN deliveries d ON d.thread_id=a.thread_id AND d.message_id=a.message_id
+                WHERE d.thread_id=? AND d.complete=0""", (str(thread_id),)).fetchall()
+            if not checkpoint:
+                boundaries.extend(timestamp - timedelta(seconds=5) for row in rows
+                                  if (timestamp := message_time(row["attempted_at"])) is not None)
+        return min(boundaries)
+
+    def observe_pending(self, thread_id, messages, cutoff, scanned_at):
+        """Persist admitted inputs, including attachments, before trying output.
+
+        Checkpoint and inbox commit together; failed/partial reads never advance
+        the checkpoint. Pending inputs have no TTL and survive missing API pages.
+        """
+        thread_id = str(thread_id)
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for message in messages:
+                timestamp = message_time(message.get("created_at"))
+                if (not message.get("is_from_visitor") or not message.get("id")
+                        or timestamp is None or timestamp < cutoff):
+                    continue
+                message_id = str(message["id"])
+                if conn.execute("SELECT 1 FROM deliveries WHERE thread_id=? AND message_id=?",
+                                (thread_id, message_id)).fetchone():
+                    continue
+                conn.execute("""INSERT INTO inbound_pending VALUES(?,?,?,?)
+                    ON CONFLICT(thread_id,message_id) DO UPDATE SET payload=excluded.payload""",
+                    (thread_id, message_id, timestamp.isoformat(), json.dumps(message, ensure_ascii=False)))
+            conn.execute("""INSERT INTO intake_checkpoints VALUES(?,?)
+                ON CONFLICT(thread_id) DO UPDATE SET scanned_at=MAX(scanned_at,excluded.scanned_at)""",
+                (thread_id, scanned_at.isoformat()))
+        return self.pending_inputs(thread_id)
+
+    def pending_inputs(self, thread_id):
+        with self._connect() as conn:
+            rows = conn.execute("""SELECT i.payload FROM inbound_pending i
+                WHERE i.thread_id=? AND NOT EXISTS (SELECT 1 FROM deliveries d
+                    WHERE d.thread_id=i.thread_id AND d.message_id=i.message_id)
+                ORDER BY i.created_at,i.message_id""", (str(thread_id),)).fetchall()
+        return [json.loads(row["payload"]) for row in rows]
 
     def thread_lock(self, thread_id):
         return thread_lock(self.path, thread_id)
@@ -55,6 +131,9 @@ class DeliveryStore:
         with self._connect() as conn:
             for message in messages:
                 if message.get("is_from_visitor") and message.get("id"):
+                    if conn.execute("SELECT 1 FROM inbound_pending WHERE thread_id=? AND message_id=?",
+                                    (str(thread_id), str(message["id"]))).fetchone():
+                        continue
                     conn.execute("INSERT OR IGNORE INTO deliveries(thread_id,message_id,payload,complete) VALUES(?,?,?,1)",
                         (str(thread_id), str(message["id"]), json.dumps({
                             "blocked_reason": "restored_history_without_receipt_requires_review"})))
@@ -161,18 +240,34 @@ class DeliveryStore:
 
     def enqueue(self, thread_id, message_id, payload):
         with self._connect() as conn:
-            conn.execute("INSERT OR IGNORE INTO deliveries(thread_id,message_id,payload) VALUES(?,?,?)",
-                         (thread_id, message_id, json.dumps(payload, ensure_ascii=False)))
+            conn.execute("INSERT OR IGNORE INTO deliveries(thread_id,message_id,payload,queued_at) VALUES(?,?,?,?)",
+                         (thread_id, message_id, json.dumps(payload, ensure_ascii=False), time.time()))
             for input_id in payload.get("source_message_ids", []):
                 if str(input_id) != str(message_id):
                     conn.execute("INSERT OR IGNORE INTO deliveries(thread_id,message_id,payload,complete) VALUES(?,?,?,1)",
                         (thread_id, str(input_id), json.dumps({"coalesced_into": str(message_id)})))
+            for input_id in set(payload.get("source_message_ids", []) + [message_id]):
+                conn.execute("DELETE FROM inbound_pending WHERE thread_id=? AND message_id=?",
+                             (thread_id, str(input_id)))
         return self.get(thread_id, message_id)
 
     def pending(self, thread_id):
         with self._connect() as conn:
             rows = conn.execute("SELECT * FROM deliveries WHERE thread_id=? AND complete=0 ORDER BY rowid", (thread_id,)).fetchall()
         return [self._decode(row) for row in rows]
+
+    def health(self):
+        """Commit a real write; return only aggregate queue data, never messages."""
+        with self._connect() as conn:
+            conn.execute("CREATE TABLE IF NOT EXISTS health_probe (id INTEGER PRIMARY KEY, checked_at REAL NOT NULL)")
+            conn.execute("INSERT OR REPLACE INTO health_probe VALUES(1,?)", (time.time(),))
+            pending = conn.execute("SELECT COUNT(*),MIN(queued_at) FROM deliveries WHERE complete=0").fetchone()
+            held = conn.execute("""SELECT COUNT(*) FROM deliveries d WHERE complete=0 AND
+                (handoff_note_state IN ('sending','uncertain') OR EXISTS
+                (SELECT 1 FROM delivery_attempts a WHERE a.thread_id=d.thread_id
+                 AND a.message_id=d.message_id AND a.state IN ('sending','uncertain')))""").fetchone()[0]
+        return {"pending": pending[0], "held": held,
+                "oldest_age_seconds": max(0, time.time() - pending[1]) if pending[1] else 0}
 
     def confirm_part(self, thread_id, message_id, count):
         with self._connect() as conn:

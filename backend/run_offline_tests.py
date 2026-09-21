@@ -3,11 +3,15 @@ import os
 import socket
 import ipaddress
 import unittest
+import tempfile
+from pathlib import Path
 from unittest.mock import patch
 
 
 if __name__ == "__main__":
+    isolated_data = tempfile.TemporaryDirectory()
     os.environ.update({
+        "DELIVERY_DB_PATH": str(Path(isolated_data.name) / "delivery.sqlite3"),
         "OPENAI_API_KEY": "test-key", "PINECONE_API_KEY": "test-key",
         "PINECONE_HOST": "https://test.svc.example.com",
         "SUPABASE_URL": "https://test.supabase.co", "SUPABASE_KEY": "test-key",
@@ -30,6 +34,9 @@ if __name__ == "__main__":
             "test_conversation_continuity", "test_logging", "test_strict_scope",
             "test_context_and_delivery_v2",
             "test_message_debounce",
+            "test_delivery_recovery",
+            "test_security_operations",
         ])
         result = unittest.TextTestRunner(verbosity=2).run(suite)
+    isolated_data.cleanup()
     raise SystemExit(0 if result.wasSuccessful() else 1)

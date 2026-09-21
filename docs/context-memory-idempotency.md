@@ -116,6 +116,11 @@ Para reconciliar, conferir o recibo/mensagem correspondente no HubSpot. Não apa
 a fila, limpar o volume ou redefinir `sent_parts` para forçar outra tentativa.
 Uma ausência na página recente de mensagens não prova que o envio falhou.
 
+Atualização de 21/09/2026: há agora uma operação com prévia, validação por GET e
+auditoria atômica, além da fila persistente de entradas. Consulte o
+[procedimento de recuperação](delivery-recovery.md) para executar
+`delivery_reconcile.py`, auditar o resultado e migrar o armazenamento com segurança.
+
 ## Validação
 
 ### Agrupamento com pausa de 5 segundos

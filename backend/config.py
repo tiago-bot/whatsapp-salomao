@@ -41,3 +41,12 @@ HUBSPOT_POLLING_INTERVAL = max(5, int(os.getenv("HUBSPOT_POLLING_INTERVAL", "10"
 HUBSPOT_MESSAGE_DEBOUNCE_SECONDS = min(30, max(0, int(os.getenv("HUBSPOT_MESSAGE_DEBOUNCE_SECONDS", "5"))))
 DELIVERY_DB_PATH = os.getenv("DELIVERY_DB_PATH", str(Path(__file__).parent / ".local" / "delivery.sqlite3"))
 SUPABASE_CONVERSATION_MEMORY_ENABLED = os.getenv("SUPABASE_CONVERSATION_MEMORY_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+
+# Fail closed: missing credentials never make protected routes public.
+ADMIN_API_TOKEN = os.getenv("ADMIN_API_TOKEN", "").strip()
+HUBSPOT_CLIENT_SECRET = os.getenv("HUBSPOT_CLIENT_SECRET", "").strip()
+HUBSPOT_WEBHOOK_URL = os.getenv("HUBSPOT_WEBHOOK_URL", "").strip()
+HUBSPOT_WEBHOOK_ALLOW_V1 = os.getenv("HUBSPOT_WEBHOOK_ALLOW_V1", "false").lower() in {"1", "true", "yes"}
+CORS_ORIGINS = [s.strip() for s in os.getenv("CORS_ORIGINS", "").split(",") if s.strip() and s.strip() != "*"]
+HEALTH_POLLING_MAX_AGE_SECONDS = max(30, int(os.getenv("HEALTH_POLLING_MAX_AGE_SECONDS", "300")))
+HEALTH_DELIVERY_MAX_AGE_SECONDS = max(30, int(os.getenv("HEALTH_DELIVERY_MAX_AGE_SECONDS", "300")))
