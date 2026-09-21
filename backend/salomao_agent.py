@@ -27,6 +27,7 @@ from config import (
     OPENAI_API_KEY,
     OPENAI_ORG_ID,
     OPENAI_PROJECT_ID,
+    PRIMARY_REASONING_EFFORT,
     TRANSCRIPTION_MODEL,
 )
 from database import db
@@ -205,7 +206,9 @@ def _openai_kwargs() -> dict[str, Any]:
 def build_primary_model() -> OpenAIChat:
     kwargs = _openai_kwargs()
     kwargs["max_completion_tokens"] = int(os.getenv("PRIMARY_MAX_COMPLETION_TOKENS", "3200"))
-    if not DEFAULT_MODEL.startswith("gpt-5"):
+    if DEFAULT_MODEL.startswith("gpt-5"):
+        kwargs["reasoning_effort"] = PRIMARY_REASONING_EFFORT
+    else:
         kwargs["temperature"] = 0.35
     return OpenAIChat(id=DEFAULT_MODEL, **kwargs)
 
@@ -871,6 +874,8 @@ class SalomaoSupervisorAgent:
             return self._documentation_response(articles, query, triage)
         try:
             kwargs = _openai_kwargs()
+            if DEFAULT_MODEL.startswith("gpt-5"):
+                kwargs["reasoning_effort"] = PRIMARY_REASONING_EFFORT
             kwargs["client_params"] = {**kwargs.get("client_params", {}), "timeout": 20.0, "max_retries": 0}
             response = Agent(
                 name="GroundedKnowledgeAnswer",

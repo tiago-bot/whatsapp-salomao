@@ -12,6 +12,13 @@ import salomao_agent
 
 
 class ApiTests(unittest.TestCase):
+    def test_primary_model_uses_sol_with_xhigh_reasoning(self):
+        with patch.object(salomao_agent, "DEFAULT_MODEL", "gpt-5.6-sol"), \
+             patch.object(salomao_agent, "PRIMARY_REASONING_EFFORT", "xhigh"):
+            model = salomao_agent.build_primary_model()
+        self.assertEqual(model.id, "gpt-5.6-sol")
+        self.assertEqual(model.reasoning_effort, "xhigh")
+
     def test_entry_date_property_triggers_ticket_processing(self):
         for date in ["1788368227429", "2026-09-02T19:37:07.429Z"]:
             with self.subTest(date=date), patch.object(main_hubspot, "process_ticket_if_valid", new_callable=AsyncMock) as process:

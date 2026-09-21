@@ -15,8 +15,11 @@ KB_LIVE_ARTICLE_HYDRATION_ENABLED = os.getenv(
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_ORG_ID = os.getenv("OPENAI_ORG_ID")
 OPENAI_PROJECT_ID = os.getenv("OPENAI_PROJECT_ID")
-DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "gpt-5.5")
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "gpt-5.6-sol")
 DEFAULT_MINI_MODEL = os.getenv("DEFAULT_MINI_MODEL", "gpt-5.4-mini")
+PRIMARY_REASONING_EFFORT = os.getenv("PRIMARY_REASONING_EFFORT", "xhigh").strip().lower()
+if PRIMARY_REASONING_EFFORT not in {"none", "low", "medium", "high", "xhigh", "max"}:
+    raise ValueError("PRIMARY_REASONING_EFFORT must be one of: none, low, medium, high, xhigh, max")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
 TRANSCRIPTION_MODEL = os.getenv("TRANSCRIPTION_MODEL", "gpt-transcribe")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
