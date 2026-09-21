@@ -23,8 +23,8 @@ Configuração, compatibilidade de assinaturas, alertas e validação:
 ## HubSpot: gatilho de entrada no atendimento
 
 - Pipeline: `636594474`.
-- Status: `1269308450`.
-- Propriedade do webhook: `hs_v2_date_entered_1269308450`.
+- Status Atendimento IA: `1135170476`.
+- Propriedade do webhook: `hs_v2_date_entered_1135170476`.
 - Evento: `ticket.propertyChange`.
 - Proprietário mantido: `A-81908844` (owner `81908844`).
 

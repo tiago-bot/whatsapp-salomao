@@ -32,7 +32,7 @@ Também foram corrigidas duas falhas de integração verificadas na API:
 a leitura do ticket não solicitava `hubspot_owner_id`; a associação recebida
 em `threadAssociations.associatedTicketId` não era normalizada para o webhook.
 Isso podia impedir o processamento antes de chegar ao modelo. Os filtros foram
-preservados: Triagem N1 (`636594474`), Teste de IA (`1269308450`) e proprietário
+preservados: Triagem N1 (`636594474`), Atendimento IA (`1135170476`) e proprietário
 Suporte inChurch (`81908844`).
 
 Na nova leitura do ticket também apareceu uma resposta a uma pergunta sobre

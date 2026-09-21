@@ -31,15 +31,15 @@ class ApiTests(unittest.TestCase):
             with self.subTest(date=date), patch.object(main_hubspot, "process_ticket_if_valid", new_callable=AsyncMock) as process:
                 asyncio.run(main_hubspot.dispatch_webhook_event({
                     "subscriptionType": "ticket.propertyChange", "objectId": 123,
-                    "propertyName": "hs_v2_date_entered_1269308450", "propertyValue": date,
+                    "propertyName": "hs_v2_date_entered_1135170476", "propertyValue": date,
                 }))
                 process.assert_awaited_once_with("123")
 
     def test_other_properties_and_cleared_entry_dates_do_not_trigger(self):
         cases = [("hs_v2_date_entered_999", "1788368227429"),
-                 ("hs_pipeline_stage", "1269308450"),
-                 ("hs_v2_date_entered_1269308450", ""),
-                 ("hs_v2_date_entered_1269308450", None)]
+                 ("hs_pipeline_stage", "1135170476"),
+                 ("hs_v2_date_entered_1135170476", ""),
+                 ("hs_v2_date_entered_1135170476", None)]
         for name, value in cases:
             with self.subTest(name=name, value=value), patch.object(main_hubspot, "process_ticket_if_valid", new_callable=AsyncMock) as process:
                 asyncio.run(main_hubspot.dispatch_webhook_event({
@@ -49,7 +49,7 @@ class ApiTests(unittest.TestCase):
                 process.assert_not_awaited()
 
     def test_entry_webhook_still_checks_all_ticket_filters(self):
-        props = {"hs_pipeline": "636594474", "hs_pipeline_stage": "1269308450", "hubspot_owner_id": "81908844"}
+        props = {"hs_pipeline": "636594474", "hs_pipeline_stage": "1135170476", "hubspot_owner_id": "81908844"}
         for changed in [None, "hs_pipeline", "hs_pipeline_stage", "hubspot_owner_id"]:
             current = {**props}
             if changed:
@@ -57,7 +57,7 @@ class ApiTests(unittest.TestCase):
             with self.subTest(changed=changed), patch.object(main_hubspot, "get_ticket_by_id", return_value={"properties": current}), patch.object(main_hubspot, "process_single_ticket", return_value={"success": True}) as process:
                 asyncio.run(main_hubspot.dispatch_webhook_event({
                     "subscriptionType": "ticket.propertyChange", "objectId": 123,
-                    "propertyName": "hs_v2_date_entered_1269308450", "propertyValue": "1788368227429",
+                    "propertyName": "hs_v2_date_entered_1135170476", "propertyValue": "1788368227429",
                 }))
                 if changed:
                     process.assert_not_called()
@@ -71,7 +71,7 @@ class ApiTests(unittest.TestCase):
         config = json.loads(manifest.read_text(encoding="utf-8"))
         self.assertEqual(config["config"]["subscriptions"]["legacyCrmObjects"][0]["propertyName"], hubspot_service.SALOMAO_ENTRY_PROPERTY)
         self.assertEqual(hubspot_service.SALOMAO_PIPELINE, "636594474")
-        self.assertEqual(hubspot_service.SALOMAO_STATUS, "1269308450")
+        self.assertEqual(hubspot_service.SALOMAO_STATUS, "1135170476")
 
     def test_chat_preserves_grounded_contract(self):
         response = {"success": True, "response": "Orientação", "session_id": "offline",

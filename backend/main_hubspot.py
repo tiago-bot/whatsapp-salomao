@@ -3,7 +3,7 @@ API Backend do Salomão para HubSpot.
 FLUXO COM POLLING:
 - Polling a cada 10s busca tickets que atendem os 3 filtros:
   1. Pipeline do Salomão (636594474)
-  2. Status do Salomão (1269308450)
+  2. Status do Salomão - Atendimento IA (1135170476)
   3. Proprietário = Salomão (81908844)
 - Processa APENAS tickets que passam nos 3 filtros
 """

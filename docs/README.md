@@ -45,7 +45,7 @@ OPENAI_API_KEY=sk-...
 # HubSpot
 HUBSPOT_ACCESS_TOKEN=pat-na1-...
 HUBSPOT_TARGET_PIPELINE=636594474
-HUBSPOT_TARGET_STATUS=1269308450
+HUBSPOT_TARGET_STATUS=1135170476
 
 # Supabase
 SUPABASE_URL=https://xxx.supabase.co
@@ -69,7 +69,7 @@ INCHURCH_API_BASE_URL=https://api.inchurch.com.br
 
 | Status | ID | Descrição |
 |--------|-----|-----------|
-| Novo (IA) | `1269308450` | Aguardando processamento do bot |
+| Atendimento IA | `1135170476` | Aguardando processamento do bot |
 | Novo (Humano) | `939275049` | Aguardando atendente humano |
 
 ---

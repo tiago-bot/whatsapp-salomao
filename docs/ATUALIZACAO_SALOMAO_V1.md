@@ -8,8 +8,8 @@ Este snapshot não importa o histórico antigo: `.env`, bancos de conversas,
 credenciais, caches e `node_modules` ficaram fora da publicação. Credenciais
 encontradas na documentação antiga foram substituídas por exemplos.
 
-Webhook alterado para `hs_v2_date_entered_1269308450`, no evento
-`ticket.propertyChange`. Pipeline `636594474`, status `1269308450` e os demais
+Webhook alterado para `hs_v2_date_entered_1135170476`, no evento
+`ticket.propertyChange`. Pipeline `636594474`, status `1135170476` e os demais
 parâmetros de atendimento foram preservados. A data apenas dispara a verificação;
 os três filtros continuam sendo consultados no HubSpot antes do processamento.
 
