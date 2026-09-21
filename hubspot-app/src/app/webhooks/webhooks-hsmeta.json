@@ -3,7 +3,7 @@
   "type": "webhooks",
   "config": {
     "settings": {
-      "targetUrl": "https://salomao-whatsapp-production.up.railway.app/webhook/hubspot",
+      "targetUrl": "https://whatsapp-salomao-production.up.railway.app/webhook/hubspot",
       "maxConcurrentRequests": 10
     },
     "subscriptions": {

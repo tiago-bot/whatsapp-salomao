@@ -25,7 +25,7 @@
     "permittedUrls": {
       "fetch": [
         "https://api.hubapi.com",
-        "https://salomao-whatsapp-production.up.railway.app"
+        "https://whatsapp-salomao-production.up.railway.app"
       ],
       "iframe": [],
       "img": []
