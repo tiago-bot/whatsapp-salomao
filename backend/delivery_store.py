@@ -97,10 +97,16 @@ class DeliveryStore:
         thread_id = str(thread_id)
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            entries = conn.execute("SELECT payload FROM deliveries WHERE thread_id=? AND message_id LIKE 'entry:%' AND complete=1",
+                                   (thread_id,)).fetchall()
+            floors = [t for row in entries
+                      if (t := message_time(json.loads(row["payload"]).get("await_user_after"))) is not None]
+            floor = max(floors, default=None)
             for message in messages:
                 timestamp = message_time(message.get("created_at"))
                 if (not message.get("is_from_visitor") or not message.get("id")
-                        or timestamp is None or timestamp < cutoff):
+                        or timestamp is None or timestamp < cutoff
+                        or (floor is not None and timestamp <= floor)):
                     continue
                 message_id = str(message["id"])
                 if conn.execute("SELECT 1 FROM deliveries WHERE thread_id=? AND message_id=?",
@@ -121,6 +127,38 @@ class DeliveryStore:
                     WHERE d.thread_id=i.thread_id AND d.message_id=i.message_id)
                 ORDER BY i.created_at,i.message_id""", (str(thread_id),)).fetchall()
         return [json.loads(row["payload"]) for row in rows]
+
+    def consume_inputs_through(self, thread_id, cutoff, reason):
+        """Keep pre-greeting inputs as context, with durable no-send receipts."""
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute("SELECT message_id,created_at FROM inbound_pending WHERE thread_id=?",
+                                (str(thread_id),)).fetchall()
+            for row in rows:
+                timestamp = message_time(row["created_at"])
+                if timestamp is None or timestamp > cutoff:
+                    continue
+                conn.execute("INSERT OR IGNORE INTO deliveries(thread_id,message_id,payload,complete) VALUES(?,?,?,1)",
+                    (str(thread_id), row["message_id"], json.dumps({"consumed_reason": reason})))
+                conn.execute("DELETE FROM inbound_pending WHERE thread_id=? AND message_id=?",
+                             (str(thread_id), row["message_id"]))
+
+    def last_confirmed_response_at(self, thread_id, since):
+        """Only local send receipts prove this service already served an entry."""
+        with self._connect() as conn:
+            rows = conn.execute("""SELECT m.created_at FROM delivery_attempts a
+                JOIN conversation_messages m ON m.thread_id=a.thread_id AND m.message_id=a.remote_id
+                WHERE a.thread_id=? AND a.state='confirmed'""", (str(thread_id),)).fetchall()
+        timestamps = [t for row in rows if (t := message_time(row["created_at"])) and t >= since]
+        return max(timestamps, default=None)
+
+    def adopt_service_entry(self, thread_id, key, cutoff):
+        """Record migration atomically; there is never an incomplete empty send."""
+        with self._connect() as conn:
+            conn.execute("INSERT OR IGNORE INTO deliveries(thread_id,message_id,payload,complete) VALUES(?,?,?,1)",
+                (str(thread_id), key, json.dumps({
+                    "answer_status": "entry_adopted", "await_user_after": cutoff.isoformat()})))
+        return self.get(thread_id, key)
 
     def thread_lock(self, thread_id):
         return thread_lock(self.path, thread_id)
@@ -218,6 +256,13 @@ class DeliveryStore:
                 (part + 1, thread_id, message_id))
             conn.execute("INSERT OR IGNORE INTO conversation_messages VALUES(?,?,?,?,?)",
                 (str(thread_id), str(remote_id), timestamp.isoformat(), "assistant", text))
+            row = conn.execute("SELECT payload FROM deliveries WHERE thread_id=? AND message_id=?",
+                               (thread_id, message_id)).fetchone()
+            payload = json.loads(row["payload"])
+            if payload.get("answer_status") == "entry_greeting":
+                payload["await_user_after"] = timestamp.isoformat()
+                conn.execute("UPDATE deliveries SET payload=? WHERE thread_id=? AND message_id=?",
+                             (json.dumps(payload, ensure_ascii=False), thread_id, message_id))
 
     @contextmanager
     def _connect(self):

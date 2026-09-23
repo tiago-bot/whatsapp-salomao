@@ -27,7 +27,7 @@ from hubspot_service import (
     get_tickets_for_salomao, get_ticket_by_id, get_conversation_thread_by_ticket,
     get_thread_messages, parse_incoming_messages, reply_to_visitor,
     transfer_ticket_to_human_support, SALOMAO_PIPELINE, SALOMAO_STATUS,
-    SALOMAO_ACTOR_ID, get_headers,
+    SALOMAO_ACTOR_ID, SALOMAO_ENTRY_PROPERTY, get_headers,
     create_ticket_handoff_note, HubSpotReadError, HubSpotSendRejected, HubSpotNoteRejected,
 )
 
@@ -35,6 +35,7 @@ logger = logging.getLogger("salomao.hubspot_bot")
 
 
 class HubSpotSalomaoBot:
+    ENTRY_GREETING = "Olá! Sou o Salomão, assistente virtual da inChurch. Como posso ajudar você com a plataforma?"
     MESSAGE_MAX_AGE_MINUTES = 5
     MAX_ATTACHMENT_BYTES = MAX_MEDIA_BYTES
     MAX_DEBOUNCE_WAIT_SECONDS = 20
@@ -408,6 +409,50 @@ class HubSpotSalomaoBot:
                 return []
             return self._process_thread_locked(thread_id, ticket_id)
 
+    def _handle_service_entry(self, thread_id, ticket_id, ticket):
+        """Greet once per stage entry; menu/history cannot become support turns.
+
+        None allows normal processing. A list ends this cycle, including after
+        the greeting, so only a subsequent customer message can resume service.
+        The outbox retains the usual uncertain-send and retry protections.
+        """
+        props = ticket.get("properties", {})
+        # Compatibility with tickets from callers that do not expose stage dates.
+        # HubSpot's production reader explicitly requests this property.
+        if SALOMAO_ENTRY_PROPERTY not in props:
+            return None
+        entered_at = message_time(props.get(SALOMAO_ENTRY_PROPERTY))
+        if entered_at is None:
+            return [{"sent": False, "error": "entry_timestamp_unavailable"}]
+        key = f"entry:{ticket_id}:{entered_at.isoformat()}"
+        entry = self.store.get(thread_id, key)
+        if entry is None:
+            # A rollout must not greet customers already served by this process.
+            prior_response = self.store.last_confirmed_response_at(thread_id, entered_at)
+            if prior_response:
+                entry = self.store.adopt_service_entry(thread_id, key, entered_at)
+            else:
+                # A legacy uncertain delivery must be reviewed before any new send.
+                if self.store.pending(thread_id):
+                    return [{"sent": False, "error": "entry_pending_delivery_requires_review"}]
+                text = self.ENTRY_GREETING
+                entry = self.store.enqueue(thread_id, key, {
+                    "response": text, "parts": [text], "answer_status": "entry_greeting",
+                    "entered_at": entered_at.isoformat(), "transfer_requested": False,
+                    "scope_policy_version": SCOPE_POLICY_VERSION,
+                    "scope_digest": approval_digest(text, [text]),
+                })
+        if not entry["complete"]:
+            delivered = self._deliver(entry, ticket_id)
+            logger.info("Saudacao de entrada processada", extra={"event": "entry.greeting",
+                        "thread_id": str(thread_id), "ticket_id": str(ticket_id)})
+            return [delivered]
+        cutoff = message_time(entry["payload"].get("await_user_after"))
+        if cutoff is None:
+            return [{"sent": False, "error": "entry_greeting_requires_review"}]
+        self.store.consume_inputs_through(thread_id, cutoff, "before_entry_greeting")
+        return None
+
     def _process_thread_locked(self, thread_id, ticket_id=None):
         lock = self._locks[hash(thread_id) % len(self._locks)]
         if not lock.acquire(blocking=False):
@@ -417,7 +462,8 @@ class HubSpotSalomaoBot:
             # Recheck eligibility even for the direct thread-processing endpoint.
             if not ticket_id:
                 return []
-            if not self._eligible(get_ticket_by_id(ticket_id)):
+            ticket = get_ticket_by_id(ticket_id)
+            if not self._eligible(ticket):
                 return []
             responses = []
             # Intake must continue even while an uncertain output holds the thread.
@@ -426,6 +472,10 @@ class HubSpotSalomaoBot:
             except HubSpotReadError:
                 logger.warning("Processamento adiado: historico indisponivel", extra={"event": "turn.deferred", "reason": "history_unavailable"})
                 return [{"error": "history_unavailable", "sent": False}]
+            entry_result = self._handle_service_entry(thread_id, ticket_id, ticket)
+            if entry_result is not None:
+                return entry_result
+            pending = [m for m in pending if not self.store.get(thread_id, m["id"])]
             for entry in self.store.pending(thread_id):
                 with log_context(thread_id=str(thread_id), ticket_id=str(ticket_id), message_id=entry["message_id"],
                                  session_id=self.get_session_id_for_thread(thread_id), run_id=entry["payload"].get("run_id")):

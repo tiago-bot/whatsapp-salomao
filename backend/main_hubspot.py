@@ -60,6 +60,19 @@ POLLING_INTERVAL = HUBSPOT_POLLING_INTERVAL
 polling_active = False
 health = OperationalHealth()
 webhook_store = WebhookStore(hubspot_bot.store.path)
+from menu_routing import MenuRouter, ENTRY_POLICY_VERSION
+menu_router = MenuRouter(hubspot_bot.store)
+
+
+async def menu_recovery_loop():
+    while True:
+        try:
+            routed = await asyncio.to_thread(menu_router.recover)
+            for ticket_id in routed:
+                await process_ticket_if_valid(ticket_id)
+        except Exception:
+            logger.exception("Recuperacao de escolhas sera repetida", extra={"event": "menu.recovery_failed"})
+        await asyncio.sleep(10)
 
 
 async def polling_loop():
@@ -152,6 +165,7 @@ async def lifespan(app: FastAPI):
              asyncio.create_task(health.run(hubspot_bot.store, webhook_store))]
     if polling_active:
         tasks.append(asyncio.create_task(polling_loop()))
+        tasks.append(asyncio.create_task(menu_recovery_loop()))
     logger.info("Servico iniciado", extra={"event": "service.started", "polling_enabled": polling_active,
                                           "scope_policy_version": SCOPE_POLICY_VERSION})
     try:
@@ -216,6 +230,7 @@ async def health_check():
     return {
         "status": "alive",
         "scope_policy_version": SCOPE_POLICY_VERSION,
+        "entry_policy_version": ENTRY_POLICY_VERSION,
         "timestamp": datetime.utcnow().isoformat()
     }
 
@@ -424,6 +439,8 @@ async def process_message_if_valid(thread_id: str):
             return
 
         # Verifica se o ticket passa nos filtros
+        await asyncio.to_thread(menu_router.watch, thread_id, associated_ticket_id)
+        await asyncio.to_thread(menu_router.process, thread_id, associated_ticket_id)
         await process_ticket_if_valid(associated_ticket_id)
 
     except Exception as e:

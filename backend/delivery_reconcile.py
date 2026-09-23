@@ -147,6 +147,10 @@ def reconcile(store, *, thread_id, message_id, remote_id, operator, reason,
                              (next_parts, int(complete), thread_id, message_id))
                 conn.execute("INSERT OR IGNORE INTO conversation_messages VALUES(?,?,?,?,?)",
                              (thread_id, remote_id, timestamp.isoformat(), "assistant", content))
+                if payload.get("answer_status") == "entry_greeting":
+                    payload["await_user_after"] = timestamp.isoformat()
+                    conn.execute("UPDATE deliveries SET payload=? WHERE thread_id=? AND message_id=?",
+                                 (json.dumps(payload, ensure_ascii=False), thread_id, message_id))
             else:
                 conn.execute("""UPDATE deliveries SET handoff_note_state='confirmed',handoff_note_id=?
                     WHERE thread_id=? AND message_id=?""", (remote_id, thread_id, message_id))

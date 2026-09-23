@@ -34,6 +34,8 @@ if __name__ == "__main__":
             "test_conversation_continuity", "test_logging", "test_strict_scope",
             "test_context_and_delivery_v2",
             "test_message_debounce",
+            "test_service_entry",
+            "test_menu_routing",
             "test_delivery_recovery",
             "test_security_operations",
             "test_media_processing",
