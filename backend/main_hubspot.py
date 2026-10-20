@@ -18,7 +18,7 @@ from typing import Optional, List
 from datetime import datetime
 from contextlib import asynccontextmanager
 from contextlib import suppress
-from config import HUBSPOT_POLLING_ENABLED, HUBSPOT_POLLING_INTERVAL, CORS_ORIGINS
+from config import HUBSPOT_POLLING_ENABLED, HUBSPOT_POLLING_INTERVAL, CORS_ORIGINS, HEALTH_DELIVERY_MAX_AGE_SECONDS
 from api_security import require_admin, verified_events
 from webhook_store import WebhookStore
 from operational_health import OperationalHealth
@@ -88,7 +88,7 @@ async def polling_loop():
 
     logger.info("Busca automatica iniciada", extra={"event": "polling.started", "interval_seconds": POLLING_INTERVAL,
         "pipeline_id": SALOMAO_PIPELINE, "stage_id": SALOMAO_STATUS, "owner_id": owner_id})
-    previous_state, last_report = None, 0.0
+    previous_state, last_report, last_sweep = None, 0.0, 0.0
 
     while polling_active:
         try:
@@ -124,6 +124,15 @@ async def polling_loop():
             health.polling_result(False)
             health.report()
             logger.exception("Falha no ciclo de busca", extra={"event": "polling.failed"})
+
+        # Drafts abandoned when a person took the ticket over would otherwise
+        # stay pending forever and keep /ready failing (deliveries_stalled).
+        if time.monotonic() - last_sweep >= 300:
+            last_sweep = time.monotonic()
+            try:
+                await asyncio.to_thread(hubspot_bot.retire_abandoned_deliveries, HEALTH_DELIVERY_MAX_AGE_SECONDS)
+            except Exception:
+                logger.exception("Limpeza de entregas abandonadas adiada", extra={"event": "delivery.retire_failed"})
 
         await asyncio.sleep(POLLING_INTERVAL)
 

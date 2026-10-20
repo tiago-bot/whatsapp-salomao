@@ -1,9 +1,12 @@
 """Bounded conversation history with stable roles and no future-message leakage."""
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 MAX_CONTEXT_MESSAGES = 30
 MAX_CONTEXT_CHARS = 24000
 MAX_MESSAGE_CHARS = 4500
+# A conversation resumed days later is a new service episode: old turns
+# ("a reunião de hoje às 12h") must not be answered as if they were current.
+MAX_CONTEXT_AGE = timedelta(hours=24)
 
 
 def message_time(value):
@@ -75,7 +78,7 @@ def history_before(messages, current):
         timestamp = message_time(message.get("created_at"))
         if str(message.get("id")) == str(current.get("id")):
             break
-        if timestamp is None or timestamp >= cutoff:
+        if timestamp is None or timestamp >= cutoff or timestamp < cutoff - MAX_CONTEXT_AGE:
             continue
         if message.get("text"):
             history.append({"role": "user" if message.get("is_from_visitor") else "assistant",

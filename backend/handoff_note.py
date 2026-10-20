@@ -59,7 +59,7 @@ def _reported_result(customer_messages):
     return "O cliente não confirmou a resolução antes da transferência."
 
 
-def build_handoff_note(*, thread_id, message_id, messages, reason, sources=None):
+def build_handoff_note(*, thread_id, message_id, messages, reason, sources=None, assistant_ids=None):
     """Return escaped HTML accepted by HubSpot's note body field.
 
     This is extractive on purpose: it summarizes observed messages without
@@ -67,12 +67,16 @@ def build_handoff_note(*, thread_id, message_id, messages, reason, sources=None)
     """
     ordered = [message for message in messages if _compact(message.get("text"))]
     customer = [_compact(m.get("text")) for m in ordered if m.get("is_from_visitor")]
-    guidance = [_compact(m.get("text")) for m in ordered
-                if not m.get("is_from_visitor") and not requests_human(m.get("text", ""))
-                and "vou encaminhar seu atendimento" not in _compact(m.get("text")).lower()]
+    # Only Salomão's confirmed sends are "guidance": triage menus and human
+    # agents share the channel but must not be reported as Salomão's answers.
+    own = [m for m in ordered if not m.get("is_from_visitor")
+           and (assistant_ids is None or str(m.get("id")) in assistant_ids)]
+    guidance = [_compact(m.get("text")) for m in own
+                if not requests_human(m.get("text", ""))
+                and "vou encaminhar" not in _compact(m.get("text")).lower()]
     problem = customer[-MAX_CONTEXT_ITEMS:]
     guidance = guidance[-MAX_GUIDANCE_ITEMS:]
-    links = _source_links(ordered, sources)
+    links = _source_links(own, sources)
     source_html = "<ul>" + "".join(
         f'<li><a href="{escape(url, quote=True)}">{escape(title)}</a></li>' for title, url in links
     ) + "</ul>" if links else "<p>Nenhuma fonte foi registrada nesta conversa.</p>"

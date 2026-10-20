@@ -259,7 +259,7 @@ class DeliveryStore:
             row = conn.execute("SELECT payload FROM deliveries WHERE thread_id=? AND message_id=?",
                                (thread_id, message_id)).fetchone()
             payload = json.loads(row["payload"])
-            if payload.get("answer_status") == "entry_greeting":
+            if payload.get("answer_status") == "entry_greeting" or payload.get("service_entry"):
                 payload["await_user_after"] = timestamp.isoformat()
                 conn.execute("UPDATE deliveries SET payload=? WHERE thread_id=? AND message_id=?",
                              (json.dumps(payload, ensure_ascii=False), thread_id, message_id))
@@ -314,6 +314,16 @@ class DeliveryStore:
         return {"pending": pending[0], "held": held,
                 "oldest_age_seconds": max(0, time.time() - pending[1]) if pending[1] else 0}
 
+    def stale_pending(self, min_age_seconds):
+        """Old unsent entries with no send in progress/uncertain (those need review)."""
+        with self._connect() as conn:
+            rows = conn.execute("""SELECT * FROM deliveries d WHERE complete=0 AND queued_at<? AND
+                handoff_note_state NOT IN ('sending','uncertain') AND NOT EXISTS
+                (SELECT 1 FROM delivery_attempts a WHERE a.thread_id=d.thread_id
+                 AND a.message_id=d.message_id AND a.state IN ('sending','uncertain'))
+                ORDER BY queued_at LIMIT 50""", (time.time() - min_age_seconds,)).fetchall()
+        return [self._decode(row) for row in rows]
+
     def confirm_part(self, thread_id, message_id, count):
         with self._connect() as conn:
             conn.execute("UPDATE deliveries SET sent_parts=? WHERE thread_id=? AND message_id=?", (count, thread_id, message_id))
@@ -347,6 +357,13 @@ class DeliveryStore:
             conn.execute("""DELETE FROM conversation_messages WHERE thread_id=? AND message_id NOT IN
                 (SELECT message_id FROM conversation_messages WHERE thread_id=?
                  ORDER BY created_at DESC, rowid DESC LIMIT 100)""", (str(thread_id), str(thread_id)))
+
+    def sent_message_ids(self, thread_id):
+        """HubSpot ids of messages this service confirmed sending (not menus or agents)."""
+        with self._connect() as conn:
+            rows = conn.execute("SELECT remote_id FROM delivery_attempts WHERE thread_id=? AND state='confirmed' "
+                                "AND remote_id IS NOT NULL", (str(thread_id),)).fetchall()
+        return {str(row["remote_id"]) for row in rows}
 
     def conversation_messages(self, thread_id):
         with self._connect() as conn:
