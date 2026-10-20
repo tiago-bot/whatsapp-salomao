@@ -230,11 +230,21 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual(self.bot.process_thread("t1", "ticket"), [])
         self.agent.process_message.assert_not_called()
 
-    def test_failed_model_still_returns_an_honest_message(self):
+    def test_failed_model_hands_the_customer_to_a_person(self):
+        # An autonomous agent without a validated answer must not leave the
+        # customer at a dead end ("tente novamente"): a person takes over.
         self.agent.process_message.return_value = {"success": False, "answer_status": "unavailable"}
         result = self.bot.process_message("t1", self.message())
-        self.assertIn("Não consegui", result["response"])
+        self.assertTrue(result["transfer_requested"])
+        self.assertIn("Vou encaminhar", result["response"])
         self.assertFalse(result["success"])
+
+    def test_media_failure_still_asks_for_a_new_file(self):
+        self.agent.process_message.return_value = {"success": False, "answer_status": "unavailable",
+            "error": "audio_unavailable", "response": "Não identifiquei som nesse áudio."}
+        result = self.bot.process_message("t1", self.message())
+        self.assertFalse(result.get("transfer_requested"))
+        self.assertIn("áudio", result["response"])
 
     def test_human_request_has_priority_over_external_scope_and_skips_model(self):
         message = self.message(text="Quero falar com o suporte sobre futebol")

@@ -18,7 +18,7 @@ from agno.team import Team
 from agno.team.team import TeamMode
 from agno.tools import Toolkit
 from openai import OpenAI
-from pydantic import BaseModel, Field, StrictBool
+from pydantic import BaseModel, Field, StrictBool, ValidationError
 
 from config import (
     DEFAULT_MINI_MODEL,
@@ -27,11 +27,14 @@ from config import (
     OPENAI_ORG_ID,
     OPENAI_PROJECT_ID,
     PRIMARY_REASONING_EFFORT,
+    RELEVANCE_MIN_SCORE,
     TRANSCRIPTION_MODEL,
 )
 from database import db
 from event_service import analyze_event_visibility, fetch_event_details
 from knowledge_base import knowledge_base
+import query_planning
+import groundedness
 from published_knowledge import contextual_query, context_relevant_articles, previous_source_urls, excerpt, safe_url
 from response_template import RESPONSE_TEMPLATE, SUPPORT_CONVERSATION_INSTRUCTIONS
 from handoff import requests_human
@@ -188,6 +191,43 @@ def _is_inchurch_scope(message: str, conversation_context: str = "") -> bool:
     return _contains_term(message, INCHURCH_SCOPE_TERMS) and not _contains_term(message, OFF_TOPIC_TERMS)
 
 
+def _answers_previous_question(history: Optional[list[dict[str, str]]]) -> bool:
+    """True when Salomão's latest message in the dialogue asked the customer something."""
+    for message in reversed(history or []):
+        if message.get("role") == "assistant":
+            content = str(message.get("content") or "").rstrip()
+            # The entry greeting is an open invitation, not a question being answered.
+            return content.endswith("?") and "como posso ajudar" not in _normalize_text(content)
+    return False
+
+
+def _merge_by_best_score(result_lists: list[list[dict]]) -> list[dict]:
+    """Union of several searches; an article keeps its best score."""
+    best: dict[str, dict] = {}
+    order: list[str] = []
+    for results in result_lists:
+        for article in results:
+            key = str(article.get("id") or article.get("url"))
+            if key not in best:
+                order.append(key)
+                best[key] = article
+            elif (article.get("score") or 0) > (best[key].get("score") or 0):
+                best[key] = article
+    ranked = [best[key] for key in order]
+    if all(isinstance(a.get("score"), (int, float)) for a in ranked):
+        ranked.sort(key=lambda a: a["score"], reverse=True)
+    return ranked[:4]
+
+
+def _relevant_enough(article: dict) -> bool:
+    """Semantic (Pinecone) matches need RELEVANCE_MIN_SCORE. Lexical catalog
+    scores use another scale and previously cited sources were already validated."""
+    score = article.get("score")
+    if article.get("retrieval") in {"published", "previous_source"} or not isinstance(score, float):
+        return True
+    return score >= RELEVANCE_MIN_SCORE
+
+
 def _out_of_scope_response() -> str:
     return SCOPE_REDIRECT
 
@@ -277,6 +317,7 @@ class TextScopeResult(BaseModel):
     status: ImageScopeStatus = ImageScopeStatus.UNCERTAIN
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     resolved_question: str = Field(default="", max_length=700)
+    classified: bool = True
 
 
 class OutputScopeReason(StrEnum):
@@ -878,6 +919,14 @@ class SalomaoSupervisorAgent:
         query = contextual_query(message, history)
         if query == message and resolved_question and not explicit_external_request(resolved_question):
             query = resolved_question
+        plan = query_planning.plan_query(message, history)
+        if plan and plan.intent != "search":
+            return self._planned_response(plan, triage)
+        # The rewritten question complements, never replaces, the customer's
+        # words: alone it lost clear questions ("cadastro um membro" -> Kids).
+        queries = [query]
+        if plan and plan.query.strip() and _normalize_text(plan.query).strip() != _normalize_text(query).strip():
+            queries.append(plan.query.strip())
         reference_urls = previous_source_urls(message, history)
         referenced = []
         if reference_urls:
@@ -886,16 +935,23 @@ class SalomaoSupervisorAgent:
             except Exception as exc:
                 logger.warning("Fonte anterior indisponivel", extra={"event": "knowledge.reference_unavailable", "error_type": type(exc).__name__})
         try:
-            articles = knowledge_base.search(query, top_k=4)
+            articles = _merge_by_best_score([knowledge_base.search(q, top_k=4) for q in queries])
             # Only expose verified official document links, never generated URLs.
             articles = [a for a in articles if a.get("content") and safe_url(a.get("url", ""))]
             articles = context_relevant_articles(articles, message, history)
+            strong = [a for a in articles if _relevant_enough(a)]
+            below_relevance = len(articles) - len(strong)
             referenced = context_relevant_articles(referenced, message, history)
-            combined = [a for a in referenced + articles if a.get("content") and safe_url(a.get("url", ""))]
+            combined = [a for a in referenced + strong if a.get("content") and safe_url(a.get("url", ""))]
             articles = list({str(a["id"]): a for a in reversed(combined)}.values())[::-1][:4]
             logger.info("Busca de conhecimento concluida", extra={"event": "knowledge.retrieved",
                 "contextualized": query != message, "source_count": len(articles),
-                "source_ids": [str(a["id"]) for a in articles], "route": triage.rota.value})
+                "source_ids": [str(a["id"]) for a in articles], "route": triage.rota.value,
+                "query_count": len(queries), "below_relevance_count": below_relevance,
+                "source_scores": [round(a["score"], 3) for a in articles if isinstance(a.get("score"), float)]})
+            if not articles and below_relevance:
+                # Only weak matches: no answer may be grounded on them.
+                return self._documentation_response([], query, triage)
         except Exception as exc:
             logger.warning("Recuperacao indisponivel | type=%s", type(exc).__name__)
             articles = context_relevant_articles(referenced, message, history)
@@ -905,11 +961,14 @@ class SalomaoSupervisorAgent:
         try:
             kwargs = _openai_kwargs()
             if DEFAULT_MODEL.startswith("gpt-5"):
-                kwargs["reasoning_effort"] = PRIMARY_REASONING_EFFORT
-            kwargs["client_params"] = {**kwargs.get("client_params", {}), "timeout": 20.0, "max_retries": 0}
+                # Separate from the Team's effort so it can be measured and tuned alone.
+                kwargs["reasoning_effort"] = os.getenv("GROUNDED_REASONING_EFFORT", PRIMARY_REASONING_EFFORT).strip().lower()
+            kwargs["client_params"] = {**kwargs.get("client_params", {}),
+                                       "timeout": float(os.getenv("GROUNDED_TIMEOUT_SECONDS", "45")), "max_retries": 0}
             response = Agent(
                 name="GroundedKnowledgeAnswer",
-                model=OpenAIChat(id=DEFAULT_MODEL, max_completion_tokens=1800, **kwargs),
+                model=OpenAIChat(id=DEFAULT_MODEL,
+                                 max_completion_tokens=int(os.getenv("GROUNDED_MAX_COMPLETION_TOKENS", "8000")), **kwargs),
                 instructions=GROUNDED_ANSWER_INSTRUCTIONS + "\n" + RESPONSE_TEMPLATE,
                 use_json_mode=True, parse_response=False, markdown=False, telemetry=False,
             ).run(json.dumps({"question": message, "resolved_question": query, "recent_history": history,
@@ -918,6 +977,10 @@ class SalomaoSupervisorAgent:
             if self._run_failed(response):
                 raise RuntimeError("model_unavailable")
             content = getattr(response, "content", None)
+            if not content:
+                # Reasoning can exhaust the budget for one answer; this is not an
+                # outage, so it must not back off every other customer.
+                raise ValueError("empty_answer")
             answer = GroundedAnswer.model_validate(content) if isinstance(content, dict) else GroundedAnswer.model_validate_json(content)
             sources = [{"id": a["id"], "title": a["title"], "url": a["url"]}
                        for a in articles if str(a["id"]) in answer.source_ids]
@@ -928,6 +991,10 @@ class SalomaoSupervisorAgent:
                 logger.warning("Resposta contradiz artigo recuperado", extra={
                     "event": "knowledge.answer_rejected", "reason": "grounding_conflict",
                     "source_count": len(articles)})
+                return self._documentation_response(articles, query, triage)
+            # On topic is not the same as correct: each statement must be in a cited article.
+            cited = [a for a in articles if str(a["id"]) in answer.source_ids]
+            if sources and not groundedness.answer_is_grounded(message, answer.answer, cited):
                 return self._documentation_response(articles, query, triage)
             # URLs and source labels are assembled from retrieval, not the model.
             text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", answer.answer)
@@ -945,7 +1012,8 @@ class SalomaoSupervisorAgent:
                 agent_trace=["published_retrieval", "grounded_answer"],
             )
         except Exception as exc:
-            _answer_model_retry_at = time.monotonic() + 60
+            if not isinstance(exc, (ValidationError, ValueError)) or str(exc) == "model_unavailable":
+                _answer_model_retry_at = time.monotonic() + 60
             logger.warning("Resposta generativa indisponivel; usando documentos | type=%s", type(exc).__name__)
             return self._documentation_response(articles, query, triage)
 
@@ -972,9 +1040,34 @@ class SalomaoSupervisorAgent:
         )
         return false_gap or negative_extrato_lead
 
-    @staticmethod
-    def _documentation_response(articles: list[dict], query: str, triage: TriageResult) -> SalomaoPipelineResponse:
+    def _planned_response(self, plan: "query_planning.QueryPlan", triage: TriageResult) -> SalomaoPipelineResponse:
+        """No knowledge-base search for messages that are not product doubts."""
+        common = dict(route=triage.rota.value, priority=triage.prioridade.value, tags=triage.tags,
+                      model_name="query_planner", agent_trace=["query_planner_" + plan.intent])
+        if plan.intent == "handoff":
+            return SalomaoPipelineResponse(
+                message="Vou encaminhar seu atendimento para a equipe da inChurch.", answer_status="no_match",
+                requires_human_handoff=True, handoff_reason="Pedido que depende da equipe inChurch, não da base de ajuda.",
+                **common)
+        if plan.intent == "closing":
+            return SalomaoPipelineResponse(
+                message="Que bom! Fico à disposição. Se precisar de algo mais, é só me chamar por aqui.",
+                answer_status="closing", **common)
+        return SalomaoPipelineResponse(message=plan.clarifying_question.strip(), answer_status="clarification", **common)
+
+    def _documentation_response(self, articles: list[dict], query: str, triage: TriageResult) -> SalomaoPipelineResponse:
         sources = [{"id": a["id"], "title": a["title"], "url": a["url"]} for a in articles[:2]]
+        if self.user_metadata.get("originating_channel") == "whatsapp":
+            # Nearest-article excerpts answered contracts with event tutorials.
+            # Without a validated answer, an autonomous agent hands the case over.
+            logger.info("Sem resposta validada; atendimento sera transferido", extra={
+                "event": "knowledge.no_validated_answer", "source_count": len(sources)})
+            return SalomaoPipelineResponse(
+                message="", answer_status="no_match", sources=sources, requires_human_handoff=True,
+                handoff_reason="O Salomão não encontrou uma orientação validada na base para este pedido.",
+                route=triage.rota.value, priority=triage.prioridade.value, tags=triage.tags,
+                model_name="documentation", agent_trace=["no_validated_answer"],
+            )
         if sources:
             sections = ["## Orientações da documentação\n\nEncontrei estes trechos na base da inChurch:"]
             for article in articles[:2]:
@@ -1267,7 +1360,7 @@ class SalomaoAgent:
                 return TextScopeResult.model_validate_json(content)
         except Exception as exc:
             logger.warning("Classificador indisponivel; geracao nao autorizada", extra={"event": "scope.input_unavailable", "error_type": type(exc).__name__})
-        return TextScopeResult()
+        return TextScopeResult(classified=False)
 
     @staticmethod
     def _guard_model():
@@ -1278,7 +1371,8 @@ class SalomaoAgent:
     def validate_response_scope(self, message: str, response: str, history: str = "") -> bool:
         """Fail closed: only explicitly approved output may leave the agent."""
         if response in {SCOPE_REDIRECT, SCOPE_CLARIFY, SCOPE_UNAVAILABLE,
-                        "Vou encaminhar seu atendimento para a equipe da inChurch."}:
+                        "Vou encaminhar seu atendimento para a equipe da inChurch.",
+                        "Vou encaminhar seu atendimento para a equipe de Suporte N1 da inChurch."}:
             return True
         if not response or obvious_external_answer(response):
             return False
@@ -1371,8 +1465,8 @@ class SalomaoAgent:
     def _image_scope_response(self, scope: ImageScopeResult) -> str:
         if scope.status == ImageScopeStatus.OUT_OF_SCOPE:
             return (
-                "Só posso analisar imagens da plataforma inChurch.\n\n"
-                "Envie um print da tela da inChurch com a marca ou o endereço visível."
+                "Só consigo analisar prints de telas da inChurch.\n\n"
+                "Me conte em texto o que aparece nessa imagem ou qual é a sua dúvida, que eu te ajudo."
             )
         return (
             "Não consegui confirmar que essa imagem é da inChurch.\n\n"
@@ -1384,8 +1478,8 @@ class SalomaoAgent:
         patterns = [
             r"admin\.inchurch\.com\.br/eventos/evento/(\d+)",
             r"inchurch\.com\.br/eventos/evento/(\d+)",
-            r"(?:id|evento|#)[:\s]*(\d{6,7})\b",
-            r"\b(\d{6,7})\b",
+            # A bare number may be a phone, an amount or a protocol: never an event by itself.
+            r"\b(?:id(?:\s+do\s+evento)?|evento)\s*(?:n[ºo°.]?\s*)?[:#]?\s*(\d{6,7})\b",
         ]
         event_id: int | None = None
         for pattern in patterns:
@@ -1662,7 +1756,15 @@ class SalomaoAgent:
                 message=effective_message,
                 conversation_context=conversation_context,
             )
-            if not image_scope.approved:
+            # A question written beside a rejected image is still answered from
+            # the text alone. Text about the image itself cannot vouch for it.
+            if (not image_scope.approved and len(re.findall(r"\w{2,}", effective_message)) >= 3
+                    and not re.search(r"\b(?:imagem|imagens|print|prints|foto|fotos|anexo|captura|screenshot|aprov\w*)\b",
+                                      _normalize_text(effective_message))):
+                logger.info("Imagem fora do escopo ignorada; texto sera atendido", extra={
+                    "event": "attachment.image_ignored", "reason": image_scope.status.value})
+                image_base64 = image_mime_type = None
+            elif not image_scope.approved:
                 logger.info(
                     "Imagem bloqueada pelo escopo visual | status=%s confidence=%.2f",
                     image_scope.status.value,
@@ -1712,6 +1814,13 @@ class SalomaoAgent:
         input_blocked = text_scope.status == ImageScopeStatus.OUT_OF_SCOPE
         input_uncertain = (not image_base64 and not spreadsheet_context and
             (text_scope.status != ImageScopeStatus.INCHURCH or text_scope.confidence < .9))
+        # "Não", "Tudo", "Valor": a short reply to Salomão's own question is a
+        # continuation, not an unknown topic. The grounded answer has the history
+        # and the output guard still validates the reply.
+        if (input_uncertain and not input_blocked and text_scope.classified
+                and _answers_previous_question(conversation_history)):
+            logger.info("Resposta curta tratada como continuacao", extra={"event": "scope.input_continuation"})
+            input_uncertain = False
         if input_blocked or input_uncertain:
             logger.info("Mensagem redirecionada antes da geracao", extra={"event": "scope.input_blocked", "reason": "external" if input_blocked else "uncertain"})
             response = SCOPE_REDIRECT if input_blocked else SCOPE_CLARIFY
@@ -1774,6 +1883,8 @@ class SalomaoAgent:
                 "decision_reason": "inchurch_input_and_allowlisted_sources",
                 "source_count": len(result.sources),
             })
+        elif result.requires_human_handoff and originating_channel == "whatsapp":
+            pass
         elif not self.validate_response_scope(effective_message, result.message, conversation_context):
             result = SalomaoPipelineResponse(message=SCOPE_UNAVAILABLE, answer_status="scope_blocked",
                 model_name="scope_guard", route="ESCOPO_BLOQUEADO", agent_trace=["output_scope_blocked"])

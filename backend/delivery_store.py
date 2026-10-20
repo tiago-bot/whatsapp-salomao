@@ -259,7 +259,7 @@ class DeliveryStore:
             row = conn.execute("SELECT payload FROM deliveries WHERE thread_id=? AND message_id=?",
                                (thread_id, message_id)).fetchone()
             payload = json.loads(row["payload"])
-            if payload.get("answer_status") == "entry_greeting":
+            if payload.get("answer_status") == "entry_greeting" or payload.get("service_entry"):
                 payload["await_user_after"] = timestamp.isoformat()
                 conn.execute("UPDATE deliveries SET payload=? WHERE thread_id=? AND message_id=?",
                              (json.dumps(payload, ensure_ascii=False), thread_id, message_id))
@@ -347,6 +347,13 @@ class DeliveryStore:
             conn.execute("""DELETE FROM conversation_messages WHERE thread_id=? AND message_id NOT IN
                 (SELECT message_id FROM conversation_messages WHERE thread_id=?
                  ORDER BY created_at DESC, rowid DESC LIMIT 100)""", (str(thread_id), str(thread_id)))
+
+    def sent_message_ids(self, thread_id):
+        """HubSpot ids of messages this service confirmed sending (not menus or agents)."""
+        with self._connect() as conn:
+            rows = conn.execute("SELECT remote_id FROM delivery_attempts WHERE thread_id=? AND state='confirmed' "
+                                "AND remote_id IS NOT NULL", (str(thread_id),)).fetchall()
+        return {str(row["remote_id"]) for row in rows}
 
     def conversation_messages(self, thread_id):
         with self._connect() as conn:

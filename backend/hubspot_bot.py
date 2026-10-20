@@ -3,10 +3,13 @@ import base64
 from datetime import datetime, timedelta, timezone
 import logging
 import mimetypes
+import re
 from threading import Lock
+from weakref import WeakValueDictionary
 from urllib.parse import urljoin, urlsplit
 import uuid
 import time
+import unicodedata
 
 import requests
 
@@ -18,10 +21,11 @@ from conversation_context import bounded_history, history_before, message_time
 from logging_config import log_context
 from media_processing import MAX_MEDIA_BYTES, AUDIO_FORMATS, AUDIO_MIME_FORMATS, normalize_audio_format
 from handoff import requests_human
+from intent_routing import route_intent
 from handoff_note import build_handoff_note
 from salomao_agent import salomao
 from whatsapp_formatting import format_whatsapp, split_whatsapp
-from scope_policy import (SCOPE_POLICY_VERSION, SCOPE_UNAVAILABLE, SCOPE_REDIRECT,
+from scope_policy import (SCOPE_POLICY_VERSION, SCOPE_UNAVAILABLE, SCOPE_REDIRECT, SCOPE_CLARIFY,
                           explicit_external_request, obvious_external_answer, approval_digest, approved_delivery)
 from hubspot_service import (
     get_tickets_for_salomao, get_ticket_by_id, get_conversation_thread_by_ticket,
@@ -36,6 +40,9 @@ logger = logging.getLogger("salomao.hubspot_bot")
 
 class HubSpotSalomaoBot:
     ENTRY_GREETING = "Olá! Sou o Salomão, assistente virtual da inChurch. Como posso ajudar você com a plataforma?"
+    HANDOFF_MESSAGE = "Vou encaminhar seu atendimento para a equipe de Suporte N1 da inChurch."
+    MEDIA_ERRORS = {"audio_unavailable", "image_unavailable", "attachment_unavailable"}
+    CLOSING_AGAIN = "Por nada! Estou por aqui se precisar."
     MESSAGE_MAX_AGE_MINUTES = 5
     MAX_ATTACHMENT_BYTES = MAX_MEDIA_BYTES
     MAX_DEBOUNCE_WAIT_SECONDS = 20
@@ -49,9 +56,17 @@ class HubSpotSalomaoBot:
             SupabaseConversationMemory() if store is None and SUPABASE_CONVERSATION_MEMORY_ENABLED else None)
         self.store = store if store is not None else DeliveryStore(DELIVERY_DB_PATH)
         self.agent = agent if agent is not None else salomao
-        # Bounded striped locks: webhook + polling cannot process the same thread
-        # concurrently, without retaining an unbounded map of customer IDs.
-        self._locks = [Lock() for _ in range(64)]
+        # One in-process lock per conversation, released from memory when unused.
+        # Striped locks made unrelated conversations skip each other's turns.
+        self._locks = WeakValueDictionary()
+        self._locks_guard = Lock()
+
+    def _thread_mutex(self, thread_id):
+        with self._locks_guard:
+            lock = self._locks.get(str(thread_id))
+            if lock is None:
+                lock = self._locks[str(thread_id)] = Lock()
+            return lock
 
     @staticmethod
     def get_session_id_for_thread(thread_id):
@@ -143,15 +158,29 @@ class HubSpotSalomaoBot:
             previous = groups[-1] if groups else None
             start = message_time(previous.get("created_at")) if previous else None
             end = message_time(message.get("created_at"))
-            if (previous and start and end and not previous.get("raw", {}).get("attachments")
-                    and not message.get("raw", {}).get("attachments")
+            # Text and attachments sent together are one turn: answering each
+            # bubble separately produced several replies to a single question.
+            # Two voice notes stay separate turns: only one audio is transcribed.
+            if (previous and start and end
+                    and not (self._has_audio(previous) and self._has_audio(message))
                     and not any(t and start < t < end for t in outgoing)
                     and len(previous.get("text", "")) + len(message.get("text", "")) <= 8000):
-                groups[-1] = {**message, "text": previous.get("text", "") + "\n" + message.get("text", ""),
+                attachments = (previous.get("raw", {}).get("attachments") or []) + (message.get("raw", {}).get("attachments") or [])
+                text = "\n".join(filter(None, [previous.get("text", ""), message.get("text", "")]))
+                groups[-1] = {**message, "text": text, "raw": {**message.get("raw", {}), "attachments": attachments},
                     "source_message_ids": previous.get("source_message_ids", [previous["id"]]) + [message["id"]]}
             else:
                 groups.append(message)
         return groups
+
+    @classmethod
+    def _has_audio(cls, message):
+        for attachment in message.get("raw", {}).get("attachments") or []:
+            mime = str(attachment.get("mimeType") or attachment.get("contentType") or "").lower()
+            if (mime.startswith("audio/") or mime in AUDIO_MIME_FORMATS or str(attachment.get("type", "")).lower() == "audio"
+                    or cls._attachment_extension(attachment) in cls.AUDIO_EXTENSIONS):
+                return True
+        return False
 
     def _download_attachment_as_base64(self, url):
         # Validate every redirect and recompute headers; signed CDN links can
@@ -208,24 +237,65 @@ class HubSpotSalomaoBot:
         known = HubSpotSalomaoBot.AUDIO_EXTENSIONS | HubSpotSalomaoBot.IMAGE_EXTENSIONS
         return next((extension for extension in extensions if extension in known), extensions[0] if extensions else "")
 
+    def _recent_dialogue(self, thread_id, message):
+        """Messages of the current service episode (24h) preceding this turn."""
+        current_ids = set(map(str, message.get("source_message_ids", [message.get("id")])))
+        return history_before([m for m in self.store.conversation_messages(thread_id)
+                               if str(m["id"]) not in current_ids], message)
+
     def process_message(self, thread_id, message):
+        result = self._process_message(thread_id, message)
+        if result.get("transfer_requested"):
+            result["response"] = format_whatsapp(result.get("handoff_message") or self.HANDOFF_MESSAGE)
+            return result
+        previous = [m["content"] for m in self._recent_dialogue(thread_id, message) if m["role"] == "assistant"]
+        same = lambda a, b: " ".join(str(a or "").split()) == " ".join(str(b or "").split())
+        if result.get("answer_status") == "routed_closing":
+            # A second "obrigado" is still a goodbye, never a handoff.
+            if previous and same(previous[-1], result["response"]):
+                result["response"] = format_whatsapp(self.CLOSING_AGAIN)
+            return result
+        # An autonomous agent must never loop: a reply identical to its previous
+        # one, or a second consecutive clarification, becomes a human handoff.
+        # Repeating the off-topic redirect is harmless and is not escalated.
+        repeated = (bool(previous) and same(result.get("response"), previous[-1])
+                    and not same(result.get("response"), SCOPE_REDIRECT))
+        clarify_again = result.get("response") == SCOPE_CLARIFY and SCOPE_CLARIFY in previous[-2:]
+        if repeated or clarify_again:
+            logger.info("Resposta repetida convertida em transferencia", extra={
+                "event": "handoff.loop_prevented", "thread_id": str(thread_id), "message_id": message.get("id")})
+            result.update(transfer_requested=True, response=format_whatsapp(self.HANDOFF_MESSAGE),
+                          handoff_reason="O Salomão não conseguiu avançar no atendimento sem repetir a mesma orientação.")
+        return result
+
+    def _process_message(self, thread_id, message):
         message_text = message.get("text", "")
         # Human support is a routing command, even when the same message also
         # mentions a subject outside the assistant's knowledge scope.
         if requests_human(message_text):
             logger.info("Pedido de suporte humano identificado", extra={
                 "event": "handoff.requested", "thread_id": str(thread_id), "message_id": message.get("id")})
-            return {"success": True, "response": "Vou encaminhar seu atendimento para a equipe de Suporte N1 da inChurch.",
+            return {"success": True, "response": self.HANDOFF_MESSAGE,
                     "answer_status": "human_handoff", "transfer_requested": True,
                     "handoff_reason": "Pedido explícito do cliente para falar com o suporte.",
                     "scope_policy_version": SCOPE_POLICY_VERSION, "model_used": "deterministic_handoff"}
+        history = self._recent_dialogue(thread_id, message)
+        # Contracts, sales, meetings and account billing are not in the help
+        # center: route them before any article search can answer them wrongly.
+        routed = route_intent(message_text, [m["content"] for m in history if m["role"] == "user"],
+                              assistant_spoke=any(m["role"] == "assistant" for m in history))
+        if routed:
+            logger.info("Intencao roteada sem consulta a base", extra={"event": "intent.routed",
+                "thread_id": str(thread_id), "message_id": message.get("id"), "reason": routed.intent})
+            return {"success": True, "response": routed.response, "handoff_message": routed.response,
+                    "answer_status": "routed_" + routed.intent, "transfer_requested": routed.transfer,
+                    "handoff_reason": routed.reason or None, "scope_policy_version": SCOPE_POLICY_VERSION,
+                    "model_used": "intent_router"}
         if explicit_external_request(message_text):
             logger.info("Pergunta externa bloqueada antes do agente", extra={"event": "scope.input_blocked", "reason": "deterministic_rule"})
             return {"success": True, "response": SCOPE_REDIRECT, "answer_status": "out_of_scope",
                     "transfer_requested": False, "scope_policy_version": SCOPE_POLICY_VERSION}
         attachments = message.get("raw", {}).get("attachments", [])
-        current_ids = set(message.get("source_message_ids", [message.get("id")]))
-        history = history_before([m for m in self.store.conversation_messages(thread_id) if m["id"] not in current_ids], message)
         kwargs = {"conversation_history": history}
         selected, truncated = bounded_history(history)
         logger.info("Contexto da conversa preparado", extra={"event": "context.loaded", "thread_id": str(thread_id),
@@ -246,22 +316,29 @@ class HubSpotSalomaoBot:
                     "content_type": mime or "unknown"})
                 if mime.startswith("image/") or kind == "image" or extension in self.IMAGE_EXTENSIONS:
                     if "image_base64" in kwargs:
-                        raise ValueError("multiple_images")
+                        # Several prints in one turn: analyse the first, keep the turn.
+                        logger.info("Imagem adicional ignorada", extra={"event": "attachment.skipped", "reason": "multiple_images"})
+                        continue
                     kwargs["image_base64"] = self._download_attachment_as_base64(url)
                     kwargs["image_mime_type"] = mime if mime.startswith("image/") else "image/jpeg"
                 elif mime in AUDIO_MIME_FORMATS or mime.startswith("audio/") or kind == "audio" or extension in self.AUDIO_EXTENSIONS:
                     if "audio_base64" in kwargs:
-                        raise ValueError("multiple_audio")
+                        logger.info("Audio adicional ignorado", extra={"event": "attachment.skipped", "reason": "multiple_audio"})
+                        continue
                     kwargs["audio_base64"] = self._download_attachment_as_base64(url)
                     kwargs["audio_format"] = normalize_audio_format(
                         extension if extension in self.AUDIO_EXTENSIONS else AUDIO_MIME_FORMATS.get(mime, "mp4"))
+                elif message_text.strip():
+                    # The written question still deserves an answer.
+                    logger.info("Anexo nao suportado ignorado", extra={"event": "attachment.skipped", "reason": "unsupported_attachment"})
                 else:
                     raise ValueError("unsupported_attachment")
         except ValueError as exc:
             logger.warning("Anexo rejeitado", extra={"event": "attachment.rejected", "reason": str(exc),
                 "thread_id": str(thread_id), "message_id": message.get("id")})
-            return {"response": "Não consegui ler esse anexo. Envie uma imagem ou áudio por vez, ou descreva a dúvida em texto.",
-                    "success": False, "transfer_requested": False, "answer_status": "unavailable", "scope_policy_version": SCOPE_POLICY_VERSION}
+            return {"response": "Não consegui abrir esse arquivo. Pode me contar em texto o que ele mostra ou qual é a sua dúvida?",
+                    "success": False, "transfer_requested": False, "answer_status": "unavailable",
+                    "error": "attachment_unavailable", "scope_policy_version": SCOPE_POLICY_VERSION}
         try:
             result = self.agent.process_message(
                 message=message_text,
@@ -276,13 +353,31 @@ class HubSpotSalomaoBot:
         if result.get("audio_transcription"):
             self.store.remember_messages(thread_id, [{**message, "is_from_visitor": True,
                 "text": "\n".join(filter(None, [message.get("text"), result["audio_transcription"]]))}])
+            # A spoken request ("quero cancelar o contrato") follows the same routes as text.
+            spoken = route_intent("\n".join(filter(None, [message_text, result["audio_transcription"]])),
+                                  [m["content"] for m in history if m["role"] == "user"],
+                                  assistant_spoke=any(m["role"] == "assistant" for m in history))
+            if spoken:
+                logger.info("Intencao do audio roteada", extra={"event": "intent.routed",
+                    "thread_id": str(thread_id), "message_id": message.get("id"), "reason": spoken.intent})
+                return {**result, "success": True, "response": spoken.response, "handoff_message": spoken.response,
+                        "answer_status": "routed_" + spoken.intent, "transfer_requested": spoken.transfer,
+                        "handoff_reason": spoken.reason or None, "scope_policy_version": SCOPE_POLICY_VERSION,
+                        "model_used": "intent_router"}
         # A documented knowledge gap is actionable in the WhatsApp helpdesk.
         if result.get("answer_status") == "no_match":
             result["transfer_requested"] = True
             if not result.get("handoff_reason"):
                 result["handoff_reason"] = "A base oficial não contém orientação suficiente para concluir o atendimento."
+        # Without a validated answer the customer goes to a person, not a dead end.
+        # Media problems (silent audio, unreadable image) still ask for a new file.
+        if (result.get("answer_status") in {"unavailable", "scope_blocked"}
+                and result.get("error") not in self.MEDIA_ERRORS):
+            result["transfer_requested"] = True
+            result["handoff_reason"] = (result.get("handoff_reason") or
+                                        "O Salomão não conseguiu validar uma orientação segura para este caso.")
         if result.get("transfer_requested"):
-            result["response"] = "Vou encaminhar seu atendimento para a equipe de Suporte N1 da inChurch."
+            result["response"] = result.get("handoff_message") or self.HANDOFF_MESSAGE
         result["response"] = format_whatsapp(result["response"])
         if (obvious_external_answer(result["response"]) or
                 (result.get("scope_policy_version") != SCOPE_POLICY_VERSION and
@@ -351,11 +446,8 @@ class HubSpotSalomaoBot:
                 return stopped
             note_body = payload.get("handoff_note_body")
             if not note_body:
-                note_body = build_handoff_note(
-                    thread_id=thread_id, message_id=message_id,
-                    messages=self.store.conversation_messages(thread_id),
-                    reason=payload.get("handoff_reason"), sources=payload.get("sources"),
-                )
+                note_body = self._handoff_note(thread_id, message_id, payload.get("handoff_reason"),
+                                               payload.get("sources"))
                 entry = self.store.update_payload(thread_id, message_id, {"handoff_note_body": note_body})
                 payload = entry["payload"]
             note_state = self.store.begin_handoff_note(thread_id, message_id)
@@ -435,13 +527,19 @@ class HubSpotSalomaoBot:
                 # A legacy uncertain delivery must be reviewed before any new send.
                 if self.store.pending(thread_id):
                     return [{"sent": False, "error": "entry_pending_delivery_requires_review"}]
-                text = self.ENTRY_GREETING
-                entry = self.store.enqueue(thread_id, key, {
-                    "response": text, "parts": [text], "answer_status": "entry_greeting",
-                    "entered_at": entered_at.isoformat(), "transfer_requested": False,
-                    "scope_policy_version": SCOPE_POLICY_VERSION,
-                    "scope_digest": approval_digest(text, [text]),
-                })
+                opening = self._opening_request(thread_id, entered_at)
+                if opening:
+                    # The customer already described the need before the menu:
+                    # answer it now instead of asking "how can I help?".
+                    entry = self._enqueue_opening_answer(thread_id, key, entered_at, opening)
+                else:
+                    text = self.ENTRY_GREETING
+                    entry = self.store.enqueue(thread_id, key, {
+                        "response": text, "parts": [text], "answer_status": "entry_greeting",
+                        "entered_at": entered_at.isoformat(), "transfer_requested": False,
+                        "scope_policy_version": SCOPE_POLICY_VERSION,
+                        "scope_digest": approval_digest(text, [text]),
+                    })
         if not entry["complete"]:
             delivered = self._deliver(entry, ticket_id)
             logger.info("Saudacao de entrada processada", extra={"event": "entry.greeting",
@@ -453,8 +551,61 @@ class HubSpotSalomaoBot:
         self.store.consume_inputs_through(thread_id, cutoff, "before_entry_greeting")
         return None
 
+    _GREETING_WORDS = re.compile(
+        r"\b(?:oi+|ola|opa|bom dia|boa tarde|boa noite|tudo bem|tudo bom|tudo certo|e ai|"
+        r"(?:a\s+)?paz(?:\s+do\s+senhor(?:\s+jesus)?)?|graca e paz|salomao|por favor|"
+        r"opcao|ou|nao sei|nsei|sei|ok)\b|\d+")
+    _MENU_PROMPT = re.compile(r"digite apenas o numero|opcao desejada|escolha uma das opcoes")
+
+    @classmethod
+    def _substantive(cls, text):
+        normalized = unicodedata.normalize("NFKD", str(text or "").casefold())
+        normalized = "".join(c for c in normalized if not unicodedata.combining(c))
+        normalized = re.sub(r"[^a-z0-9\s]", " ", normalized)
+        remaining = [w for w in cls._GREETING_WORDS.sub(" ", normalized).split() if len(w) > 1]
+        return len(remaining) >= 2
+
+    def _opening_request(self, thread_id, entered_at):
+        """Customer messages describing a need before this stage entry (24h),
+        after the last reply that was not the triage menu."""
+        messages = [m for m in self.store.conversation_messages(thread_id)
+                    if (t := message_time(m.get("created_at"))) and entered_at - timedelta(hours=24) <= t <= entered_at]
+        start = 0
+        for index, m in enumerate(messages):
+            if not m["is_from_visitor"] and not self._MENU_PROMPT.search(
+                    unicodedata.normalize("NFKD", m["text"].casefold()).encode("ascii", "ignore").decode()):
+                start = index + 1
+        return [m for m in messages[start:] if m["is_from_visitor"] and self._substantive(m["text"])]
+
+    def _enqueue_opening_answer(self, thread_id, key, entered_at, opening):
+        message = {"id": key, "text": "\n".join(m["text"] for m in opening)[:8000],
+                   "created_at": opening[-1]["created_at"], "raw": {},
+                   "source_message_ids": [m["id"] for m in opening]}
+        logger.info("Pedido anterior ao menu respondido na entrada", extra={"event": "entry.opening_request",
+            "thread_id": str(thread_id), "message_count": len(opening)})
+        result = self.process_message(thread_id, message)
+        parts = split_whatsapp(result["response"], WHATSAPP_MAX_MESSAGE_LENGTH)
+        payload = {"response": result["response"], "parts": parts, "service_entry": True,
+                   "answer_status": result.get("answer_status", "answered"),
+                   "entered_at": entered_at.isoformat(), "user_message": message["text"],
+                   "transfer_requested": bool(result.get("transfer_requested")),
+                   "handoff_reason": result.get("handoff_reason"), "sources": result.get("sources", []),
+                   "scope_policy_version": result.get("scope_policy_version"),
+                   "scope_digest": approval_digest(result["response"], parts)}
+        # Opening ids are answered by this entry; they are not enqueued again.
+        entry = self.store.enqueue(thread_id, key, payload)
+        if payload["transfer_requested"]:
+            entry = self.store.update_payload(thread_id, key, {"handoff_note_body": self._handoff_note(
+                thread_id, key, result.get("handoff_reason"), result.get("sources", []))})
+        return entry
+
+    def _handoff_note(self, thread_id, message_id, reason, sources):
+        return build_handoff_note(thread_id=thread_id, message_id=message_id,
+                                  messages=self.store.conversation_messages(thread_id), reason=reason,
+                                  sources=sources, assistant_ids=self.store.sent_message_ids(thread_id))
+
     def _process_thread_locked(self, thread_id, ticket_id=None):
-        lock = self._locks[hash(thread_id) % len(self._locks)]
+        lock = self._thread_mutex(thread_id)
         if not lock.acquire(blocking=False):
             logger.debug("Conversa ja esta em processamento", extra={"event": "turn.skipped", "thread_id": str(thread_id), "reason": "thread_locked"})
             return []
@@ -545,11 +696,8 @@ class HubSpotSalomaoBot:
                         "scope_digest": approval_digest(result["response"], parts),
                     })
                     if result.get("transfer_requested"):
-                        note_body = build_handoff_note(
-                            thread_id=thread_id, message_id=message["id"],
-                            messages=self.store.conversation_messages(thread_id),
-                            reason=result.get("handoff_reason"), sources=result.get("sources", []),
-                        )
+                        note_body = self._handoff_note(thread_id, message["id"], result.get("handoff_reason"),
+                                                       result.get("sources", []))
                         entry = self.store.update_payload(thread_id, message["id"], {"handoff_note_body": note_body})
                     if not self._eligible(get_ticket_by_id(ticket_id)):
                         logger.info("Envio suspenso: ticket fora dos filtros", extra={"event": "delivery.deferred", "reason": "eligibility_changed"})
@@ -590,7 +738,7 @@ class HubSpotSalomaoBot:
             return self._send_manual_locked(ticket_id, thread_id, question)
 
     def _send_manual_locked(self, ticket_id, thread_id, question):
-        lock = self._locks[hash(thread_id) % len(self._locks)]
+        lock = self._thread_mutex(thread_id)
         with lock:
             if self.store.pending(thread_id):
                 return {"success": False, "error": "Há uma entrega pendente nesta conversa"}

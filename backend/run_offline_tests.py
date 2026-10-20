@@ -18,6 +18,9 @@ if __name__ == "__main__":
         "HUBSPOT_ACCESS_TOKEN": "test-key", "HUBSPOT_POLLING_ENABLED": "false",
         "HUBSPOT_MESSAGE_DEBOUNCE_SECONDS": "0",
         "AGNO_TELEMETRY": "false",
+        # Each planner test enables it explicitly; others must not call a model.
+        "QUERY_PLANNER_ENABLED": "false",
+        "GROUNDEDNESS_CHECK_ENABLED": "false",
     })
     original_connect = socket.socket.connect
     def local_only(sock, address):
@@ -39,6 +42,9 @@ if __name__ == "__main__":
             "test_delivery_recovery",
             "test_security_operations",
             "test_media_processing",
+            "test_ticket_regressions",
+            "test_query_planning",
+            "test_groundedness",
         ])
         result = unittest.TextTestRunner(verbosity=2).run(suite)
     isolated_data.cleanup()
