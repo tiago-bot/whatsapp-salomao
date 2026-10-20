@@ -28,7 +28,7 @@ from whatsapp_formatting import format_whatsapp, split_whatsapp
 from scope_policy import (SCOPE_POLICY_VERSION, SCOPE_UNAVAILABLE, SCOPE_REDIRECT, SCOPE_CLARIFY,
                           explicit_external_request, obvious_external_answer, approval_digest, approved_delivery)
 from hubspot_service import (
-    get_tickets_for_salomao, get_ticket_by_id, get_conversation_thread_by_ticket,
+    get_tickets_for_salomao, get_ticket_by_id, get_conversation_thread_by_ticket, get_thread_by_id,
     get_thread_messages, parse_incoming_messages, reply_to_visitor,
     transfer_ticket_to_human_support, SALOMAO_PIPELINE, SALOMAO_STATUS,
     SALOMAO_ACTOR_ID, SALOMAO_ENTRY_PROPERTY, get_headers,
@@ -699,8 +699,9 @@ class HubSpotSalomaoBot:
                         note_body = self._handoff_note(thread_id, message["id"], result.get("handoff_reason"),
                                                        result.get("sources", []))
                         entry = self.store.update_payload(thread_id, message["id"], {"handoff_note_body": note_body})
-                    if not self._eligible(get_ticket_by_id(ticket_id)):
-                        logger.info("Envio suspenso: ticket fora dos filtros", extra={"event": "delivery.deferred", "reason": "eligibility_changed"})
+                    # A takeover before the first send retires the draft (audited);
+                    # leaving it pending kept /ready failing on deliveries_stalled.
+                    if self._delivery_eligibility(thread_id, message["id"], ticket_id):
                         break
                     delivered = self._deliver(entry, ticket_id)
                     responses.append(delivered)
@@ -711,6 +712,28 @@ class HubSpotSalomaoBot:
             return responses
         finally:
             lock.release()
+
+    def retire_abandoned_deliveries(self, min_age_seconds):
+        """Retire old unsent drafts whose ticket a person took over.
+
+        Only entries with no send in progress or uncertain: those still need a
+        human review. Tickets that are unavailable or still eligible are kept.
+        """
+        retired = 0
+        for entry in self.store.stale_pending(min_age_seconds):
+            thread_id, message_id = entry["thread_id"], entry["message_id"]
+            with self.store.thread_lock(thread_id) as acquired:
+                if not acquired:
+                    continue
+                ticket_id = (get_thread_by_id(thread_id) or {}).get("associatedTicketId")
+                if not ticket_id or not self._ineligible_reason(get_ticket_by_id(ticket_id)).startswith("different_"):
+                    continue
+                self.store.quarantine(thread_id, message_id, "abandoned_after_ticket_left_salomao")
+                retired += 1
+                logger.info("Entrega abandonada encerrada para auditoria", extra={
+                    "event": "delivery.retired", "thread_id": str(thread_id), "message_id": message_id,
+                    "ticket_id": str(ticket_id), "reason": "ticket_left_salomao"})
+        return retired
 
     def process_ticket(self, ticket_id):
         reason = self._ineligible_reason(get_ticket_by_id(ticket_id))

@@ -314,6 +314,16 @@ class DeliveryStore:
         return {"pending": pending[0], "held": held,
                 "oldest_age_seconds": max(0, time.time() - pending[1]) if pending[1] else 0}
 
+    def stale_pending(self, min_age_seconds):
+        """Old unsent entries with no send in progress/uncertain (those need review)."""
+        with self._connect() as conn:
+            rows = conn.execute("""SELECT * FROM deliveries d WHERE complete=0 AND queued_at<? AND
+                handoff_note_state NOT IN ('sending','uncertain') AND NOT EXISTS
+                (SELECT 1 FROM delivery_attempts a WHERE a.thread_id=d.thread_id
+                 AND a.message_id=d.message_id AND a.state IN ('sending','uncertain'))
+                ORDER BY queued_at LIMIT 50""", (time.time() - min_age_seconds,)).fetchall()
+        return [self._decode(row) for row in rows]
+
     def confirm_part(self, thread_id, message_id, count):
         with self._connect() as conn:
             conn.execute("UPDATE deliveries SET sent_parts=? WHERE thread_id=? AND message_id=?", (count, thread_id, message_id))

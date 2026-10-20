@@ -7,6 +7,7 @@ customer text below is quoted from those conversations.
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, patch
@@ -331,6 +332,48 @@ class ReviewFixTests(unittest.TestCase):
     def test_entry_greeting_is_not_a_question_being_answered(self):
         history = [{"role": "assistant", "content": module.HubSpotSalomaoBot.ENTRY_GREETING}]
         self.assertFalse(agent_module._answers_previous_question(history))
+
+
+class AbandonedDeliveryTests(unittest.TestCase):
+    """deliveries_stalled kept /ready at 503 in production (2026-10-20 logs)."""
+
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.store = DeliveryStore(Path(folder.name) / "delivery.sqlite3")
+        self.bot = module.HubSpotSalomaoBot(self.store, MagicMock(), debounce_seconds=0)
+        self.taken = {"properties": {"hs_pipeline": "636459134", "hs_pipeline_stage": "939275049", "hubspot_owner_id": "123"}}
+        patch.object(module, "get_thread_by_id", return_value={"associatedTicketId": "ticket"}).start()
+        self.ticket = patch.object(module, "get_ticket_by_id", return_value=self.taken).start()
+        self.addCleanup(patch.stopall)
+
+    def queue(self, key, age):
+        self.store.enqueue("t", key, {"response": "x", "parts": ["x"]})
+        with self.store._connect() as conn:
+            conn.execute("UPDATE deliveries SET queued_at=? WHERE message_id=?", (time.time() - age, key))
+
+    def test_draft_left_by_takeover_is_retired_and_health_clears(self):
+        self.queue("old", 900)
+        self.assertGreater(self.store.health()["oldest_age_seconds"], 300)
+        self.assertEqual(self.bot.retire_abandoned_deliveries(300), 1)
+        entry = self.store.get("t", "old")
+        self.assertEqual((entry["complete"], entry["payload"]["blocked_reason"]), (1, "abandoned_after_ticket_left_salomao"))
+        self.assertEqual(self.store.health()["pending"], 0)
+
+    def test_recent_eligible_unavailable_or_uncertain_entries_are_kept(self):
+        self.queue("recent", 10)
+        self.assertEqual(self.bot.retire_abandoned_deliveries(300), 0)
+        self.queue("eligible", 900)
+        self.ticket.return_value = {"properties": {"hs_pipeline": module.SALOMAO_PIPELINE,
+            "hs_pipeline_stage": module.SALOMAO_STATUS, "hubspot_owner_id": module.SALOMAO_ACTOR_ID.removeprefix("A-")}}
+        self.assertEqual(self.bot.retire_abandoned_deliveries(300), 0)
+        self.ticket.return_value = None
+        self.assertEqual(self.bot.retire_abandoned_deliveries(300), 0)
+        self.ticket.return_value = self.taken
+        self.store.begin_part("t", "eligible", 0)
+        self.store.failed_part("t", "eligible", 0)  # uncertain: needs human review
+        self.assertEqual([e["message_id"] for e in self.store.stale_pending(300)], [])
+        self.assertEqual(self.store.get("t", "eligible")["complete"], 0)
 
 
 class HumanQueueDestinationTests(unittest.TestCase):
