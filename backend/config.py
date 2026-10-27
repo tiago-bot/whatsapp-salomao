@@ -26,6 +26,14 @@ PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_HOST = os.getenv("PINECONE_HOST")
 PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "inchurch-hubspot-kb")
 PINECONE_SCORE_THRESHOLD = float(os.getenv("PINECONE_SCORE_THRESHOLD", "0.3"))
+# Minimum semantic score for an article to ground a customer answer. Measured on
+# real tickets: wrong matches scored 0.30-0.47 once the planner removes requests the base
+# cannot answer; correct articles can score as low as 0.49 ("API Pública" for WhatsApp).
+RELEVANCE_MIN_SCORE = float(os.getenv("RELEVANCE_MIN_SCORE", "0.45"))
+# Classify the message and rewrite the search question before querying the base.
+QUERY_PLANNER_ENABLED = os.getenv("QUERY_PLANNER_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+# Every grounded answer is checked claim by claim against its cited articles.
+GROUNDEDNESS_CHECK_ENABLED = os.getenv("GROUNDEDNESS_CHECK_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 HUBSPOT_GRAPHQL_API = os.getenv("HUBSPOT_GRAPHQL_API")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
