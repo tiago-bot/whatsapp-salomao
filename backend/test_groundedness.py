@@ -25,6 +25,35 @@ class GroundednessCheckTests(unittest.TestCase):
         self.assertFalse(self.check({"supported": True, "unsupported_claims": ["o app é o da igreja"]}))
         self.assertFalse(self.check({"supported": False}))
 
+    def test_only_wrong_statements_block_a_correct_short_answer(self):
+        def claim(text, kind):
+            return {"claim": text, "kind": kind}
+        # Incidente 24/11: respostas corretas foram retidas por omitir contexto do artigo.
+        self.assertTrue(self.check({"supported": False, "unsupported_claims": [
+            claim("Revise e clique em Salvar", "omissao"), claim("crie ou edite a trilha", "parafrase")]}))
+        for kind in ["inventado", "contradiz", "generaliza", "confirma_suposicao", "promessa", "outra_pergunta",
+                     "desconhecido"]:
+            with self.subTest(kind=kind):
+                self.assertFalse(self.check({"supported": True, "unsupported_claims": [
+                    claim("Acesse Configurações > Avançado", kind)]}))
+
+    def test_questions_and_stated_gaps_are_never_claims(self):
+        self.assertTrue(self.check({"supported": False, "unsupported_claims": [
+            {"claim": "Você quer remover notificações no celular ou no painel?", "kind": "inventado"},
+            {"claim": "A documentação disponível não detalha como limpá-las.", "kind": "inventado"}]}))
+        # A wrong step next to them still blocks.
+        self.assertFalse(self.check({"supported": False, "unsupported_claims": [
+            {"claim": "Você quer remover no celular?", "kind": "inventado"},
+            {"claim": "Toque em Limpar tudo no menu", "kind": "inventado"}]}))
+
+    def test_fragment_of_a_question_is_judged_by_its_sentence(self):
+        answer = ("Você quer limpar os avisos do celular ou remover notificações já criadas no **painel**? "
+                  "Acesse **Conteúdo > Limpar tudo**.")
+        result = groundedness.GroundednessResult.model_validate({"supported": False, "unsupported_claims": [
+            {"claim": "remover notificações já criadas no painel", "kind": "inventado"},
+            {"claim": "Conteúdo > Limpar tudo", "kind": "inventado"}]})
+        self.assertEqual(result.blocking_claims(answer), ["Conteúdo > Limpar tudo"])
+
     def test_any_failure_holds_the_answer(self):
         for kwargs in [{"content": "not-json"}, {"content": {"supported": "true"}}, {"content": {}},
                        {"content": {"supported": True}, "status": "ERROR"}, {"side_effect": TimeoutError("secret")}]:

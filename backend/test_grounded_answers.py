@@ -171,6 +171,16 @@ class GroundedAnswers(unittest.TestCase):
             self.assertIsNone(result.error)
             self.assertEqual(result.route, "CUSTOMER_SUCCESS")
 
+    def test_gap_that_asks_the_customer_keeps_the_conversation(self):
+        # The WhatsApp bot transfers every no_match; a question still has an answer to wait for.
+        with patch.object(m.knowledge_base, "search", return_value=[]), patch.object(m, "Agent") as agent:
+            agent.return_value.run.return_value = SimpleNamespace(status="COMPLETED", content={
+                "answer": "A documentação não confirma uma função geral de grupos. Você fala de **células**?",
+                "insufficient_knowledge": True})
+            result = self.supervisor.run_pipeline(message="Consigo organizar os membros em grupos?")
+            self.assertEqual(result.answer_status, "clarification")
+            self.assertFalse(result.requires_human_handoff)
+
 
 if __name__ == "__main__":
     unittest.main()

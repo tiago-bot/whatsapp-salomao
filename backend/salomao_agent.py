@@ -1002,7 +1002,12 @@ class SalomaoSupervisorAgent:
             if sources:
                 text += "\n\n" + "\n".join(f"Fonte: [{s['title']}]({s['url']})" for s in sources)
             prompt, completion, total = self._extract_token_breakdown(response)
-            status = "no_match" if answer.insufficient_knowledge else "clarification" if answer.needs_clarification else "answered"
+            # A gap that ends asking the customer ("Você fala de células?") is still a
+            # conversation, not a handoff: the WhatsApp bot transfers every no_match.
+            asks_customer = answer.answer.strip().endswith("?")
+            status = ("no_match" if answer.insufficient_knowledge and not asks_customer
+                      else "clarification" if answer.needs_clarification or answer.insufficient_knowledge
+                      else "answered")
             logger.info("Resposta fundamentada | status=%s sources=%s", status, len(sources))
             return SalomaoPipelineResponse(
                 message=text, answer_status=status, sources=sources,
